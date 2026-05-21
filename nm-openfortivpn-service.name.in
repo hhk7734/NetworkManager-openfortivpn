@@ -9,6 +9,6 @@ plugin=libnm-vpn-plugin-openfortivpn.so
 
 [GNOME]
 auth-dialog=nm-openfortivpn-auth-dialog
-properties=libnm-vpn-plugin-openfortivpn.so
+properties=libnm-openfortivpn-properties.so
 supports-external-ui-mode=false
 supports-hints=false

@@ -1,21 +1,24 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  *
- * The connection-editor plugin entry point. nm-connection-editor dlopens this
- * shared module and calls nm_vpn_editor_plugin_factory() to instantiate the
- * GObject that implements NMVpnEditorPluginInterface. */
+ * Lightweight libnm plugin entry point. NetworkManager clients may load this
+ * during VPN plugin discovery, so it must not link GTK or construct UI.
+ */
 
 #include "config.h"
 
 #include <NetworkManager.h>
 
 #include "nm-openfortivpn-editor-plugin.h"
-#include "nm-openfortivpn-editor.h"
 #include "nm-openfortivpn-service-defines.h"
+
+#define OPENFORTIVPN_PROPERTIES_PLUGIN "libnm-openfortivpn-properties.so"
 
 static void editor_plugin_iface_init(NMVpnEditorPluginInterface *iface);
 
 struct _NMOpenfortivpnEditorPlugin {
     GObject parent;
+
+    NMVpnEditorPlugin *properties_plugin;
 };
 
 G_DEFINE_TYPE_WITH_CODE(NMOpenfortivpnEditorPlugin, nm_openfortivpn_editor_plugin, G_TYPE_OBJECT,
@@ -29,12 +32,63 @@ enum {
     PROP_SERVICE,
 };
 
+static const char *
+get_properties_plugin_name(NMVpnEditorPlugin *iface)
+{
+    NMVpnPluginInfo *plugin_info = nm_vpn_editor_plugin_get_plugin_info(iface);
+    const char *name = NULL;
+
+    if (plugin_info) {
+        name = nm_vpn_plugin_info_lookup_property(plugin_info,
+                                                  NM_VPN_PLUGIN_INFO_KF_GROUP_GNOME,
+                                                  "properties");
+    }
+
+    return (name && *name) ? name : OPENFORTIVPN_PROPERTIES_PLUGIN;
+}
+
+static char *
+normalize_plugin_filename(const char *name)
+{
+    if (g_str_has_suffix(name, ".so"))
+        return g_strdup(name);
+
+    return g_strconcat(name, ".so", NULL);
+}
+
+static NMVpnEditorPlugin *
+load_properties_plugin(NMOpenfortivpnEditorPlugin *self,
+                       NMVpnEditorPlugin *iface,
+                       GError **error)
+{
+    if (!self->properties_plugin) {
+        g_autofree char *plugin = normalize_plugin_filename(get_properties_plugin_name(iface));
+        int check_owner = g_path_is_absolute(plugin) ? -1 : 0;
+
+        self->properties_plugin =
+            nm_vpn_editor_plugin_load_from_file(plugin,
+                                                NM_DBUS_SERVICE_OPENFORTIVPN,
+                                                check_owner,
+                                                NULL,
+                                                NULL,
+                                                error);
+    }
+
+    return self->properties_plugin;
+}
+
 /* --- iface impl --------------------------------------------------------- */
 
 static NMVpnEditor *
-get_editor(G_GNUC_UNUSED NMVpnEditorPlugin *iface, NMConnection *connection, GError **error)
+get_editor(NMVpnEditorPlugin *iface, NMConnection *connection, GError **error)
 {
-    return nm_openfortivpn_editor_new(connection, error);
+    NMOpenfortivpnEditorPlugin *self = NM_OPENFORTIVPN_EDITOR_PLUGIN(iface);
+    NMVpnEditorPlugin *properties_plugin = load_properties_plugin(self, iface, error);
+
+    if (!properties_plugin)
+        return NULL;
+
+    return nm_vpn_editor_plugin_get_editor(properties_plugin, connection, error);
 }
 
 static NMVpnEditorPluginCapability
@@ -47,7 +101,7 @@ get_capabilities(G_GNUC_UNUSED NMVpnEditorPlugin *iface)
 static void
 editor_plugin_iface_init(NMVpnEditorPluginInterface *iface)
 {
-    iface->get_editor      = get_editor;
+    iface->get_editor       = get_editor;
     iface->get_capabilities = get_capabilities;
 }
 
@@ -69,10 +123,20 @@ static void
 nm_openfortivpn_editor_plugin_init(G_GNUC_UNUSED NMOpenfortivpnEditorPlugin *self) { }
 
 static void
+nm_openfortivpn_editor_plugin_dispose(GObject *obj)
+{
+    NMOpenfortivpnEditorPlugin *self = NM_OPENFORTIVPN_EDITOR_PLUGIN(obj);
+
+    g_clear_object(&self->properties_plugin);
+    G_OBJECT_CLASS(nm_openfortivpn_editor_plugin_parent_class)->dispose(obj);
+}
+
+static void
 nm_openfortivpn_editor_plugin_class_init(NMOpenfortivpnEditorPluginClass *klass)
 {
     GObjectClass *gobject_class = G_OBJECT_CLASS(klass);
     gobject_class->get_property = get_property;
+    gobject_class->dispose = nm_openfortivpn_editor_plugin_dispose;
 
     g_object_class_override_property(gobject_class, PROP_NAME,    NM_VPN_EDITOR_PLUGIN_NAME);
     g_object_class_override_property(gobject_class, PROP_DESC,    NM_VPN_EDITOR_PLUGIN_DESCRIPTION);

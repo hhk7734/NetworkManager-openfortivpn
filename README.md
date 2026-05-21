@@ -37,7 +37,8 @@ The install places the following files on disk:
 /usr/share/dbus-1/system.d/nm-openfortivpn-service.conf     D-Bus policy (own bus name)
 /usr/libexec/nm-openfortivpn-service                        VPN service daemon
 /usr/libexec/nm-openfortivpn-auth-dialog                    password prompt
-/usr/lib/<triplet>/NetworkManager/libnm-vpn-plugin-openfortivpn.so   GTK4 properties editor
+/usr/lib/<triplet>/NetworkManager/libnm-vpn-plugin-openfortivpn.so   lightweight libnm plugin
+/usr/lib/<triplet>/NetworkManager/libnm-openfortivpn-properties.so    GTK4 properties editor
 ```
 
 ## Uninstall
