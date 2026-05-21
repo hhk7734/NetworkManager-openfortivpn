@@ -1,0 +1,14 @@
+[VPN Connection]
+name=openfortivpn
+service=org.freedesktop.NetworkManager.openfortivpn
+program=@LIBEXECDIR@/nm-openfortivpn-service
+supports-multiple-connections=true
+
+[libnm]
+plugin=libnm-vpn-plugin-openfortivpn.so
+
+[GNOME]
+auth-dialog=nm-openfortivpn-auth-dialog
+properties=libnm-vpn-plugin-openfortivpn.so
+supports-external-ui-mode=false
+supports-hints=false
