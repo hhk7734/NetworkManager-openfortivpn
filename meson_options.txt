@@ -1,0 +1,6 @@
+option(
+  'gtk4',
+  type: 'feature',
+  value: 'auto',
+  description: 'Build GTK4 + libadwaita properties editor and auth dialog',
+)
