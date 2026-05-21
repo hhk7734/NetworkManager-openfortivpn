@@ -20,3 +20,15 @@ shared_module(
   install:             true,
   install_dir:         nm_plugin_dir,
 )
+
+test_editor = executable(
+  'test-editor',
+  ['test-editor.c',
+   'nm-openfortivpn-editor.c',
+   properties_resources],
+  include_directories: inc,
+  dependencies:        [libnm_dep, gio_dep, gtk4_dep],
+  c_args:              ['-DG_LOG_DOMAIN="nm-openfortivpn-properties-test"'],
+)
+
+test('properties-editor', test_editor)

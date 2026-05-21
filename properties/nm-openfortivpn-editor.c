@@ -19,12 +19,12 @@ struct _NMOpenfortivpnEditor {
     GtkWidget   *widget;          /* the top-level GtkBox shown in the editor */
     GtkBuilder  *builder;
 
-    GtkEntry    *gateway_entry;
-    GtkEntry    *port_entry;
-    GtkEntry    *user_entry;
-    GtkEntry    *password_entry;        /* GtkPasswordEntry */
+    GtkEditable *gateway_entry;
+    GtkEditable *port_entry;
+    GtkEditable *user_entry;
+    GtkEditable *password_entry;        /* GtkPasswordEntry; only GtkEditable is used */
     GtkSwitch   *save_password_switch;
-    GtkEntry    *trusted_cert_entry;
+    GtkEditable *trusted_cert_entry;
     GtkSwitch   *insecure_switch;
 };
 
@@ -34,9 +34,9 @@ G_DEFINE_TYPE_WITH_CODE(NMOpenfortivpnEditor, nm_openfortivpn_editor, G_TYPE_OBJ
 /* --- helpers ------------------------------------------------------------ */
 
 static const char *
-entry_text(GtkEntry *e)
+entry_text(GtkEditable *e)
 {
-    return gtk_editable_get_text(GTK_EDITABLE(e));
+    return gtk_editable_get_text(e);
 }
 
 static void
@@ -45,7 +45,7 @@ sync_password_sensitivity(NMOpenfortivpnEditor *self)
     gboolean save = gtk_switch_get_active(self->save_password_switch);
     gtk_widget_set_sensitive(GTK_WIDGET(self->password_entry), save);
     if (!save)
-        gtk_editable_set_text(GTK_EDITABLE(self->password_entry), "");
+        gtk_editable_set_text(self->password_entry, "");
 }
 
 static void
@@ -68,7 +68,7 @@ load_from_connection(NMOpenfortivpnEditor *self, NMConnection *connection)
     const char *v;
 #define LOAD_ENTRY(field, key) \
     do { v = nm_setting_vpn_get_data_item(s_vpn, (key)); \
-         if (v) gtk_editable_set_text(GTK_EDITABLE(self->field), v); } while (0)
+         if (v) gtk_editable_set_text(self->field, v); } while (0)
 
     LOAD_ENTRY(gateway_entry,       NM_OPENFORTIVPN_KEY_GATEWAY);
     LOAD_ENTRY(port_entry,          NM_OPENFORTIVPN_KEY_PORT);
@@ -94,7 +94,7 @@ load_from_connection(NMOpenfortivpnEditor *self, NMConnection *connection)
     if (save) {
         v = nm_setting_vpn_get_secret(s_vpn, NM_OPENFORTIVPN_KEY_PASSWORD);
         if (v)
-            gtk_editable_set_text(GTK_EDITABLE(self->password_entry), v);
+            gtk_editable_set_text(self->password_entry, v);
     }
 }
 
@@ -170,14 +170,14 @@ nm_openfortivpn_editor_new(NMConnection *connection, GError **error)
     self->builder = gtk_builder_new_from_resource(
         "/org/freedesktop/NetworkManager/openfortivpn/nm-openfortivpn-dialog.ui");
 
-    self->widget               = GTK_WIDGET(gtk_builder_get_object(self->builder, "openfortivpn-box"));
-    self->gateway_entry        = GTK_ENTRY (gtk_builder_get_object(self->builder, "gateway-entry"));
-    self->port_entry           = GTK_ENTRY (gtk_builder_get_object(self->builder, "port-entry"));
-    self->user_entry           = GTK_ENTRY (gtk_builder_get_object(self->builder, "user-entry"));
-    self->password_entry       = GTK_ENTRY (gtk_builder_get_object(self->builder, "password-entry"));
-    self->save_password_switch = GTK_SWITCH(gtk_builder_get_object(self->builder, "save-password-switch"));
-    self->trusted_cert_entry   = GTK_ENTRY (gtk_builder_get_object(self->builder, "trusted-cert-entry"));
-    self->insecure_switch      = GTK_SWITCH(gtk_builder_get_object(self->builder, "insecure-switch"));
+    self->widget               = GTK_WIDGET  (gtk_builder_get_object(self->builder, "openfortivpn-box"));
+    self->gateway_entry        = GTK_EDITABLE(gtk_builder_get_object(self->builder, "gateway-entry"));
+    self->port_entry           = GTK_EDITABLE(gtk_builder_get_object(self->builder, "port-entry"));
+    self->user_entry           = GTK_EDITABLE(gtk_builder_get_object(self->builder, "user-entry"));
+    self->password_entry       = GTK_EDITABLE(gtk_builder_get_object(self->builder, "password-entry"));
+    self->save_password_switch = GTK_SWITCH  (gtk_builder_get_object(self->builder, "save-password-switch"));
+    self->trusted_cert_entry   = GTK_EDITABLE(gtk_builder_get_object(self->builder, "trusted-cert-entry"));
+    self->insecure_switch      = GTK_SWITCH  (gtk_builder_get_object(self->builder, "insecure-switch"));
 
     if (!self->widget) {
         g_set_error_literal(error, NM_CONNECTION_ERROR,
