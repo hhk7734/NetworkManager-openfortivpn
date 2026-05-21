@@ -1,0 +1,70 @@
+[env]
+BUILDDIR = "builddir"
+PREFIX = "/usr"
+SYSCONFDIR = "/etc"
+LIBEXECDIR = "/usr/libexec"
+
+[tasks."deps:ubuntu"]
+description = "Install build and runtime dependencies on Ubuntu/Debian"
+run = """
+sudo apt install \
+  meson ninja-build pkg-config gcc \
+  libnm-dev libglib2.0-dev libgtk-4-dev libadwaita-1-dev \
+  openfortivpn
+"""
+
+[tasks.setup]
+description = "Configure the Meson build directory"
+run = """
+if [ -d "$BUILDDIR" ]; then
+  meson setup "$BUILDDIR" \
+    --prefix="$PREFIX" \
+    --sysconfdir="$SYSCONFDIR" \
+    --libexecdir="$LIBEXECDIR" \
+    --reconfigure
+else
+  meson setup "$BUILDDIR" \
+    --prefix="$PREFIX" \
+    --sysconfdir="$SYSCONFDIR" \
+    --libexecdir="$LIBEXECDIR"
+fi
+"""
+
+[tasks.build]
+description = "Build the project"
+depends = ["setup"]
+run = 'meson compile -C "$BUILDDIR"'
+
+[tasks.test]
+description = "Run the test suite"
+depends = ["build"]
+run = 'meson test -C "$BUILDDIR" --print-errorlogs'
+
+[tasks.install]
+description = "Install the plugin and restart NetworkManager"
+depends = ["build"]
+run = """
+sudo meson install -C "$BUILDDIR"
+sudo systemctl restart NetworkManager
+"""
+
+[tasks.restart]
+description = "Restart NetworkManager"
+run = "sudo systemctl restart NetworkManager"
+
+[tasks.uninstall]
+description = "Uninstall the plugin and restart NetworkManager"
+run = """
+sudo ninja -C "$BUILDDIR" uninstall
+sudo systemctl restart NetworkManager
+"""
+
+[tasks."try"]
+description = "Create and start an example openfortivpn connection"
+run = """
+nmcli connection add type vpn ifname '*' \
+  con-name 'corp-openfortivpn' \
+  vpn-type openfortivpn \
+  vpn.data 'gateway=vpn.example.com,port=443,user=alice'
+nmcli connection up corp-openfortivpn --ask
+"""

@@ -19,28 +19,16 @@ nm-openfortivpn-service.name.in   NM service descriptor template
 ## Build dependencies (Ubuntu/Debian names)
 
 ```sh
-sudo apt install \
-  meson ninja-build pkg-config gcc \
-  libnm-dev libglib2.0-dev libgtk-4-dev libadwaita-1-dev \
-  openfortivpn
+mise run deps:ubuntu
 ```
-
-Fedora-equivalent: `meson ninja-build NetworkManager-libnm-devel glib2-devel
-gtk4-devel libadwaita-devel openfortivpn`.
 
 ## Build and install
 
 ```sh
-meson setup builddir --prefix=/usr --sysconfdir=/etc --libexecdir=/usr/libexec
-meson compile -C builddir
-sudo meson install -C builddir
+mise run install
 ```
 
-After install, restart NetworkManager so it picks up the new VPN type:
-
-```sh
-sudo systemctl restart NetworkManager
-```
+The install task restarts NetworkManager so it picks up the new VPN type.
 
 The install places the following files on disk:
 
@@ -58,18 +46,13 @@ The install places the following files on disk:
 the D-Bus policy at `/usr/share/dbus-1/system.d/nm-openfortivpn-service.conf`:
 
 ```sh
-sudo ninja -C builddir uninstall
-sudo systemctl restart NetworkManager
+mise run uninstall
 ```
 
 ## Try it
 
 ```sh
-nmcli connection add type vpn ifname '*' \
-  con-name 'corp-openfortivpn' \
-  vpn-type openfortivpn \
-  vpn.data 'gateway=vpn.example.com,port=443,user=alice'
-nmcli connection up corp-openfortivpn --ask
+mise run try
 ```
 
 ## Roadmap
