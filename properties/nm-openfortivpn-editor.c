@@ -82,9 +82,9 @@ load_from_connection(NMOpenfortivpnEditor *self, NMConnection *connection)
 
     /* Password storage:
      *   NOT_SAVED -> "Ask every time"
-     *   anything else (incl. AGENT_OWNED / NONE) -> "Save password"
+     *   anything else -> "Save password"
      * Default for a new connection is "Save password" with empty value. */
-    NMSettingSecretFlags flags = NM_SETTING_SECRET_FLAG_AGENT_OWNED;
+    NMSettingSecretFlags flags = NM_SETTING_SECRET_FLAG_NONE;
     nm_setting_get_secret_flags(NM_SETTING(s_vpn),
                                 NM_OPENFORTIVPN_KEY_PASSWORD, &flags, NULL);
     gboolean save = !(flags & NM_SETTING_SECRET_FLAG_NOT_SAVED);
@@ -134,12 +134,12 @@ update_connection(NMVpnEditor *iface, NMConnection *connection, G_GNUC_UNUSED GE
         nm_setting_vpn_add_data_item(s_vpn, NM_OPENFORTIVPN_KEY_INSECURE_SSL, "yes");
 
     /* Password handling — controlled by the per-secret flags.
-     *   Switch ON  -> AGENT_OWNED, store value if user typed one
+     *   Switch ON  -> NONE, store value in the system connection if typed
      *   Switch OFF -> NOT_SAVED, drop any stored value */
     if (gtk_switch_get_active(self->save_password_switch)) {
         nm_setting_set_secret_flags(NM_SETTING(s_vpn),
                                     NM_OPENFORTIVPN_KEY_PASSWORD,
-                                    NM_SETTING_SECRET_FLAG_AGENT_OWNED, NULL);
+                                    NM_SETTING_SECRET_FLAG_NONE, NULL);
         const char *pw = entry_text(self->password_entry);
         if (pw && *pw)
             nm_setting_vpn_add_secret(s_vpn, NM_OPENFORTIVPN_KEY_PASSWORD, pw);
