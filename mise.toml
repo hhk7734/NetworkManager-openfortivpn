@@ -43,10 +43,10 @@ run = 'meson test -C "$BUILDDIR" --print-errorlogs'
 [tasks.install]
 description = "Install the plugin and restart NetworkManager"
 depends = ["build"]
-run = """
-sudo meson install -C "$BUILDDIR"
-sudo systemctl restart NetworkManager
-"""
+run = [
+  "sudo meson install -C \"$BUILDDIR\"",
+  "sudo systemctl restart NetworkManager",
+]
 
 [tasks.restart]
 description = "Restart NetworkManager"
@@ -54,10 +54,10 @@ run = "sudo systemctl restart NetworkManager"
 
 [tasks.uninstall]
 description = "Uninstall the plugin and restart NetworkManager"
-run = """
-sudo ninja -C "$BUILDDIR" uninstall
-sudo systemctl restart NetworkManager
-"""
+run = [
+  "sudo ninja -C \"$BUILDDIR\" uninstall",
+  "sudo systemctl restart NetworkManager",
+]
 
 [tasks."try"]
 description = "Create and start an example openfortivpn connection"
