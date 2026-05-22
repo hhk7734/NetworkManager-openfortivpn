@@ -8,7 +8,7 @@ supports-multiple-connections=true
 plugin=libnm-vpn-plugin-openfortivpn.so
 
 [GNOME]
-auth-dialog=nm-openfortivpn-auth-dialog
+auth-dialog=@LIBEXECDIR@/nm-openfortivpn-auth-dialog
 properties=libnm-openfortivpn-properties.so
 supports-external-ui-mode=false
 supports-hints=false

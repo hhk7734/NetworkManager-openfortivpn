@@ -9,7 +9,7 @@ description = "Install build and runtime dependencies on Ubuntu/Debian"
 run = """
 sudo apt install \
   meson ninja-build pkg-config gcc \
-  libnm-dev libglib2.0-dev libgtk-4-dev libadwaita-1-dev \
+  libnm-dev libglib2.0-dev libgtk-4-dev libadwaita-1-dev libsecret-1-dev \
   openfortivpn
 """
 

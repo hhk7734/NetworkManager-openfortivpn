@@ -22,7 +22,6 @@ struct _NMOpenfortivpnEditor {
     GtkEditable *gateway_entry;
     GtkEditable *port_entry;
     GtkEditable *user_entry;
-    GtkEditable *password_entry;        /* GtkPasswordEntry; only GtkEditable is used */
     GtkSwitch   *save_password_switch;
     GtkEditable *trusted_cert_entry;
     GtkSwitch   *insecure_switch;
@@ -37,25 +36,6 @@ static const char *
 entry_text(GtkEditable *e)
 {
     return gtk_editable_get_text(e);
-}
-
-static void
-sync_password_sensitivity(NMOpenfortivpnEditor *self)
-{
-    gboolean save = gtk_switch_get_active(self->save_password_switch);
-    gtk_widget_set_sensitive(GTK_WIDGET(self->password_entry), save);
-    if (!save)
-        gtk_editable_set_text(self->password_entry, "");
-}
-
-static void
-on_save_switch_toggled(G_GNUC_UNUSED GObject *obj,
-                       G_GNUC_UNUSED GParamSpec *pspec,
-                       gpointer user_data)
-{
-    NMOpenfortivpnEditor *self = user_data;
-    sync_password_sensitivity(self);
-    g_signal_emit_by_name(G_OBJECT(self), "changed");
 }
 
 static void
@@ -80,26 +60,25 @@ load_from_connection(NMOpenfortivpnEditor *self, NMConnection *connection)
     gtk_switch_set_active(self->insecure_switch,
                           v && (g_ascii_strcasecmp(v, "yes") == 0));
 
-    /* Password storage:
-     *   NOT_SAVED -> "Ask every time"
-     *   anything else -> "Save password"
-     * Default for a new connection is "Save password" with empty value. */
-    NMSettingSecretFlags flags = NM_SETTING_SECRET_FLAG_NONE;
+    NMSettingSecretFlags flags = NM_SETTING_SECRET_FLAG_AGENT_OWNED;
     nm_setting_get_secret_flags(NM_SETTING(s_vpn),
-                                NM_OPENFORTIVPN_KEY_PASSWORD, &flags, NULL);
-    gboolean save = !(flags & NM_SETTING_SECRET_FLAG_NOT_SAVED);
-    gtk_switch_set_active(self->save_password_switch, save);
-    sync_password_sensitivity(self);
-
-    if (save) {
-        v = nm_setting_vpn_get_secret(s_vpn, NM_OPENFORTIVPN_KEY_PASSWORD);
-        if (v)
-            gtk_editable_set_text(self->password_entry, v);
-    }
+                                NM_OPENFORTIVPN_KEY_PASSWORD,
+                                &flags,
+                                NULL);
+    gtk_switch_set_active(self->save_password_switch,
+                          !(flags & NM_SETTING_SECRET_FLAG_NOT_SAVED));
 }
 
 static void
 on_changed(G_GNUC_UNUSED GtkWidget *w, gpointer user_data)
+{
+    g_signal_emit_by_name(G_OBJECT(user_data), "changed");
+}
+
+static void
+on_notify_changed(G_GNUC_UNUSED GObject *obj,
+                  G_GNUC_UNUSED GParamSpec *pspec,
+                  gpointer user_data)
 {
     g_signal_emit_by_name(G_OBJECT(user_data), "changed");
 }
@@ -133,21 +112,12 @@ update_connection(NMVpnEditor *iface, NMConnection *connection, G_GNUC_UNUSED GE
     if (gtk_switch_get_active(self->insecure_switch))
         nm_setting_vpn_add_data_item(s_vpn, NM_OPENFORTIVPN_KEY_INSECURE_SSL, "yes");
 
-    /* Password handling — controlled by the per-secret flags.
-     *   Switch ON  -> NONE, store value in the system connection if typed
-     *   Switch OFF -> NOT_SAVED, drop any stored value */
-    if (gtk_switch_get_active(self->save_password_switch)) {
-        nm_setting_set_secret_flags(NM_SETTING(s_vpn),
-                                    NM_OPENFORTIVPN_KEY_PASSWORD,
-                                    NM_SETTING_SECRET_FLAG_NONE, NULL);
-        const char *pw = entry_text(self->password_entry);
-        if (pw && *pw)
-            nm_setting_vpn_add_secret(s_vpn, NM_OPENFORTIVPN_KEY_PASSWORD, pw);
-    } else {
-        nm_setting_set_secret_flags(NM_SETTING(s_vpn),
-                                    NM_OPENFORTIVPN_KEY_PASSWORD,
-                                    NM_SETTING_SECRET_FLAG_NOT_SAVED, NULL);
-    }
+    nm_setting_set_secret_flags(NM_SETTING(s_vpn),
+                                NM_OPENFORTIVPN_KEY_PASSWORD,
+                                gtk_switch_get_active(self->save_password_switch)
+                                    ? NM_SETTING_SECRET_FLAG_AGENT_OWNED
+                                    : NM_SETTING_SECRET_FLAG_NOT_SAVED,
+                                NULL);
 
     nm_connection_add_setting(connection, NM_SETTING(g_steal_pointer(&s_vpn)));
     return TRUE;
@@ -174,7 +144,6 @@ nm_openfortivpn_editor_new(NMConnection *connection, GError **error)
     self->gateway_entry        = GTK_EDITABLE(gtk_builder_get_object(self->builder, "gateway-entry"));
     self->port_entry           = GTK_EDITABLE(gtk_builder_get_object(self->builder, "port-entry"));
     self->user_entry           = GTK_EDITABLE(gtk_builder_get_object(self->builder, "user-entry"));
-    self->password_entry       = GTK_EDITABLE(gtk_builder_get_object(self->builder, "password-entry"));
     self->save_password_switch = GTK_SWITCH  (gtk_builder_get_object(self->builder, "save-password-switch"));
     self->trusted_cert_entry   = GTK_EDITABLE(gtk_builder_get_object(self->builder, "trusted-cert-entry"));
     self->insecure_switch      = GTK_SWITCH  (gtk_builder_get_object(self->builder, "insecure-switch"));
@@ -194,12 +163,11 @@ nm_openfortivpn_editor_new(NMConnection *connection, GError **error)
     g_signal_connect(self->gateway_entry,        "changed", G_CALLBACK(on_changed), self);
     g_signal_connect(self->port_entry,           "changed", G_CALLBACK(on_changed), self);
     g_signal_connect(self->user_entry,           "changed", G_CALLBACK(on_changed), self);
-    g_signal_connect(self->password_entry,       "changed", G_CALLBACK(on_changed), self);
+    g_signal_connect(self->save_password_switch, "notify::active",
+                     G_CALLBACK(on_notify_changed), self);
     g_signal_connect(self->trusted_cert_entry,   "changed", G_CALLBACK(on_changed), self);
     g_signal_connect(self->insecure_switch,      "notify::active",
-                     G_CALLBACK(on_changed), self);
-    g_signal_connect(self->save_password_switch, "notify::active",
-                     G_CALLBACK(on_save_switch_toggled), self);
+                     G_CALLBACK(on_notify_changed), self);
 
     return NM_VPN_EDITOR(self);
 }

@@ -3,8 +3,8 @@
 NetworkManager VPN plugin that drives [openfortivpn](https://github.com/adrienverge/openfortivpn)
 to connect to Fortinet SSL VPN gateways.
 
-Status: **early skeleton.** v1 scope is username + password auth, GTK 4 +
-libadwaita UI, and IPv4 only.
+Status: **early skeleton.** v1 scope is username + password auth, Secret
+Service password storage, GTK 4 + libadwaita UI, and IPv4 only.
 
 ## Layout
 
@@ -40,6 +40,11 @@ The install places the following files on disk:
 /usr/lib/<triplet>/NetworkManager/libnm-vpn-plugin-openfortivpn.so   lightweight libnm plugin
 /usr/lib/<triplet>/NetworkManager/libnm-openfortivpn-properties.so    GTK4 properties editor
 ```
+
+## Passwords
+
+Passwords are entered at connection time. Check **Save password** in the auth
+dialog to store the password in the user's Secret Service keyring.
 
 ## Uninstall
 

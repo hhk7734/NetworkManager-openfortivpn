@@ -18,6 +18,7 @@ libnm_dep        = dependency('libnm',         version: '>= 1.40')
 gio_dep          = dependency('gio-2.0',       version: '>= 2.66')
 gtk4_dep         = dependency('gtk4',          version: '>= 4.6',  required: get_option('gtk4'))
 libadwaita_dep   = dependency('libadwaita-1',  version: '>= 1.2',  required: get_option('gtk4'))
+libsecret_dep    = dependency('libsecret-1',   version: '>= 0.18', required: get_option('gtk4'))
 
 prefix     = get_option('prefix')
 libdir     = get_option('libdir')
@@ -75,7 +76,7 @@ inc = include_directories('.', 'shared')
 
 subdir('src')
 subdir('auth-dialog')
-if gtk4_dep.found() and libadwaita_dep.found()
+if gtk4_dep.found() and libadwaita_dep.found() and libsecret_dep.found()
   subdir('properties')
 endif
 
@@ -83,6 +84,6 @@ summary({
   'prefix':       prefix,
   'libdir':       libdir,
   'libexecdir':   libexecdir,
-  'GTK4 plugin':  gtk4_dep.found() and libadwaita_dep.found(),
+  'GTK4 plugin':  gtk4_dep.found() and libadwaita_dep.found() and libsecret_dep.found(),
   'openfortivpn': openfortivpn_path,
 }, section: 'Build configuration')
