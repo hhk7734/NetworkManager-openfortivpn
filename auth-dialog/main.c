@@ -15,7 +15,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include <glib.h>
 #include <gtk/gtk.h>
@@ -215,44 +214,16 @@ update_password_save_flag(const char *uuid, gboolean save_password)
     g_main_loop_run(loop);
 }
 
-static char *
-read_stdin_to_string(void)
-{
-    GString *str = g_string_new(NULL);
-    char buf[256];
-    size_t n;
-
-    while ((n = fread(buf, 1, sizeof(buf), stdin)) > 0)
-        g_string_append_len(str, buf, n);
-
-    return g_string_free(str, FALSE);
-}
-
 static void
-finish_password_save_after_secret_request(const char *uuid,
-                                          const char *connection_name,
-                                          gboolean save_password)
+finish_password_flag_update_after_secret_request(const char *uuid,
+                                                 gboolean save_password)
 {
-    g_autofree char *password = NULL;
-
-    if (save_password)
-        password = read_stdin_to_string();
-
     g_usleep(2 * G_USEC_PER_SEC);
-
-    if (save_password) {
-        store_saved_password(uuid, connection_name, password);
-    } else {
-        clear_saved_password(uuid);
-    }
-
     update_password_save_flag(uuid, save_password);
 }
 
 static void
-spawn_delayed_password_save_finish(const char *uuid,
-                                   const char *connection_name,
-                                   const char *password,
+spawn_delayed_password_flag_update(const char *uuid,
                                    gboolean save_password)
 {
     if (!uuid || !*uuid)
@@ -265,57 +236,29 @@ spawn_delayed_password_save_finish(const char *uuid,
     const char *argv_save_with_name[] = {
         self,
         "--update-password-save-flag", uuid,
-        "-n", connection_name,
         "--save-password-flag",
         NULL,
     };
-    const char *argv_save_without_name[] = {
-        self,
-        "--update-password-save-flag", uuid,
-        "--save-password-flag",
-        NULL,
-    };
-    const char *argv_not_save_with_name[] = {
-        self,
-        "--update-password-save-flag", uuid,
-        "-n", connection_name,
-        NULL,
-    };
-    const char *argv_not_save_without_name[] = {
+    const char *argv_not_save[] = {
         self,
         "--update-password-save-flag", uuid,
         NULL,
     };
-    char **child_argv = (char **) (save_password
-        ? (connection_name && *connection_name ? argv_save_with_name : argv_save_without_name)
-        : (connection_name && *connection_name ? argv_not_save_with_name : argv_not_save_without_name));
+    char **child_argv = (char **) (save_password ? argv_save_with_name : argv_not_save);
     g_autoptr(GError) error = NULL;
-    int stdin_fd = -1;
 
-    if (!g_spawn_async_with_pipes(NULL,
-                                  child_argv,
-                                  NULL,
-                                  G_SPAWN_STDOUT_TO_DEV_NULL |
-                                      G_SPAWN_STDERR_TO_DEV_NULL |
-                                      G_SPAWN_SEARCH_PATH,
-                                  NULL,
-                                  NULL,
-                                  NULL,
-                                  &stdin_fd,
-                                  NULL,
-                                  NULL,
-                                  &error)) {
+    if (!g_spawn_async(NULL,
+                       child_argv,
+                       NULL,
+                       G_SPAWN_STDOUT_TO_DEV_NULL |
+                           G_SPAWN_STDERR_TO_DEV_NULL |
+                           G_SPAWN_SEARCH_PATH,
+                       NULL,
+                       NULL,
+                       NULL,
+                       &error)) {
         g_warning("failed to spawn password flag updater: %s",
                   error ? error->message : "unknown error");
-        if (stdin_fd >= 0)
-            close(stdin_fd);
-        return;
-    }
-
-    if (stdin_fd >= 0) {
-        if (save_password && password)
-            (void) write(stdin_fd, password, strlen(password));
-        close(stdin_fd);
     }
 }
 
@@ -521,9 +464,8 @@ main(int argc, char *argv[])
     }
 
     if (opt_update_password_save_flag) {
-        finish_password_save_after_secret_request(opt_update_password_save_flag,
-                                                  opt_name,
-                                                  opt_save_password_flag);
+        finish_password_flag_update_after_secret_request(opt_update_password_save_flag,
+                                                         opt_save_password_flag);
         return EXIT_SUCCESS;
     }
 
@@ -587,13 +529,20 @@ main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    if (prompted) {
+        if (save_password)
+            store_saved_password(opt_uuid, opt_name, password);
+        else
+            clear_saved_password(opt_uuid);
+    }
+
     emit_secret(NM_OPENFORTIVPN_KEY_PASSWORD, password);
     fputs("\n\n", stdout);
     fflush(stdout);
 
     wait_for_quit();
     if (prompted)
-        spawn_delayed_password_save_finish(opt_uuid, opt_name, password, save_password);
+        spawn_delayed_password_flag_update(opt_uuid, save_password);
 
     return EXIT_SUCCESS;
 }
