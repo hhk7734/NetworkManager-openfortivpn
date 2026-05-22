@@ -3,8 +3,9 @@
 NetworkManager VPN plugin that drives [openfortivpn](https://github.com/adrienverge/openfortivpn)
 to connect to Fortinet SSL VPN gateways.
 
-Status: **early skeleton.** v1 scope is username + password auth, Secret
-Service password storage, GTK 4 + libadwaita UI, and IPv4 only.
+Status: **v0.1.0 works on Ubuntu 26.04.** Current scope is username +
+password auth, Secret Service password storage, GTK 4 + libadwaita UI, and
+IPv4 only.
 
 ## Layout
 
