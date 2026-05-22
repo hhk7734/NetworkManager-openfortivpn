@@ -429,6 +429,9 @@ nm_openfortivpn_plugin_dispose(GObject *obj)
     if (self->cancellable)
         g_cancellable_cancel(self->cancellable);
 
+    if (self->child)
+        g_subprocess_send_signal(self->child, SIGINT);
+
     g_clear_object(&self->child_stdout);
     g_clear_object(&self->child);
     g_clear_object(&self->cancellable);
@@ -466,6 +469,11 @@ static gboolean opt_persist = FALSE;
 static gboolean opt_debug   = FALSE;
 static char    *opt_bus_name = NULL;
 
+typedef struct {
+    GMainLoop             *loop;
+    NMOpenfortivpnPlugin  *plugin;
+} RuntimeCtx;
+
 static GOptionEntry option_entries[] = {
     { "persist",   0, 0, G_OPTION_ARG_NONE,   &opt_persist,
       "Don't quit after a single disconnect", NULL },
@@ -479,9 +487,33 @@ static GOptionEntry option_entries[] = {
 static gboolean
 on_term(gpointer user_data)
 {
-    GMainLoop *loop = user_data;
-    g_main_loop_quit(loop);
+    RuntimeCtx *ctx = user_data;
+    openfortivpn_disconnect(NM_VPN_SERVICE_PLUGIN(ctx->plugin), NULL);
+    g_main_loop_quit(ctx->loop);
     return G_SOURCE_REMOVE;
+}
+
+static void
+on_nm_vanished(G_GNUC_UNUSED GDBusConnection *connection,
+               const char      *name,
+               gpointer         user_data)
+{
+    RuntimeCtx *ctx = user_data;
+
+    g_message("%s disappeared; stopping openfortivpn service", name);
+    openfortivpn_disconnect(NM_VPN_SERVICE_PLUGIN(ctx->plugin), NULL);
+    g_main_loop_quit(ctx->loop);
+}
+
+static void
+on_state_changed(G_GNUC_UNUSED NMVpnServicePlugin *plugin,
+                 NMVpnServiceState state,
+                 gpointer user_data)
+{
+    GMainLoop *loop = user_data;
+
+    if (state == NM_VPN_SERVICE_STATE_STOPPED)
+        g_main_loop_quit(loop);
 }
 
 int
@@ -517,14 +549,28 @@ main(int argc, char *argv[])
     }
 
     g_autoptr(GMainLoop) loop = g_main_loop_new(NULL, FALSE);
+    RuntimeCtx runtime = {
+        .loop = loop,
+        .plugin = plugin,
+    };
 
-    g_unix_signal_add(SIGTERM, on_term, loop);
-    g_unix_signal_add(SIGINT,  on_term, loop);
+    g_unix_signal_add(SIGTERM, on_term, &runtime);
+    g_unix_signal_add(SIGINT,  on_term, &runtime);
+
+    guint nm_watch_id = g_bus_watch_name(G_BUS_TYPE_SYSTEM,
+                                         NM_DBUS_SERVICE,
+                                         G_BUS_NAME_WATCHER_FLAGS_NONE,
+                                         NULL,
+                                         on_nm_vanished,
+                                         &runtime,
+                                         NULL);
 
     if (!opt_persist) {
         g_signal_connect_swapped(plugin, "quit", G_CALLBACK(g_main_loop_quit), loop);
+        g_signal_connect(plugin, "state-changed", G_CALLBACK(on_state_changed), loop);
     }
 
     g_main_loop_run(loop);
+    g_bus_unwatch_name(nm_watch_id);
     return EXIT_SUCCESS;
 }
