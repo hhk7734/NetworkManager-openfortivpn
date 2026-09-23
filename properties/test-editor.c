@@ -135,7 +135,7 @@ test_saved_password_becomes_agent_owned(void)
     NMSettingVpn *s_vpn = nm_connection_get_setting_vpn(output);
     g_assert_nonnull(s_vpn);
     assert_password_flags(s_vpn, NM_SETTING_SECRET_FLAG_AGENT_OWNED);
-    g_assert_null(nm_setting_vpn_get_secret(s_vpn, NM_OPENFORTIVPN_KEY_PASSWORD));
+    g_assert_cmpstr(nm_setting_vpn_get_secret(s_vpn, NM_OPENFORTIVPN_KEY_PASSWORD), ==, "secret");
 }
 
 static void
@@ -158,6 +158,58 @@ test_agent_owned_password_stays_agent_owned(void)
     NMSettingVpn *s_vpn = nm_connection_get_setting_vpn(output);
     g_assert_nonnull(s_vpn);
     assert_password_flags(s_vpn, NM_SETTING_SECRET_FLAG_AGENT_OWNED);
+    g_assert_null(nm_setting_vpn_get_secret(s_vpn, NM_OPENFORTIVPN_KEY_PASSWORD));
+}
+
+/* A secret-less update makes the GNOME agent delete the keyring item, so the
+ * editor must hand back the password it was given. */
+static void
+test_agent_owned_password_is_carried_through(void)
+{
+    if (!ensure_gtk())
+        return;
+
+    g_autoptr(GError) error = NULL;
+    g_autoptr(NMConnection) input =
+        new_connection_with_password_flags(NM_SETTING_SECRET_FLAG_AGENT_OWNED, "secret");
+    g_autoptr(NMVpnEditor) editor = nm_openfortivpn_editor_new(input, &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(editor);
+
+    g_autoptr(NMConnection) output = nm_simple_connection_new();
+    g_assert_true(nm_vpn_editor_update_connection(editor, output, &error));
+    g_assert_no_error(error);
+
+    NMSettingVpn *s_vpn = nm_connection_get_setting_vpn(output);
+    g_assert_nonnull(s_vpn);
+    assert_password_flags(s_vpn, NM_SETTING_SECRET_FLAG_AGENT_OWNED);
+    g_assert_cmpstr(nm_setting_vpn_get_secret(s_vpn, NM_OPENFORTIVPN_KEY_PASSWORD), ==, "secret");
+}
+
+static void
+test_turning_off_save_drops_password(void)
+{
+    if (!ensure_gtk())
+        return;
+
+    g_autoptr(GError) error = NULL;
+    g_autoptr(NMConnection) input =
+        new_connection_with_password_flags(NM_SETTING_SECRET_FLAG_AGENT_OWNED, "secret");
+    g_autoptr(NMVpnEditor) editor = nm_openfortivpn_editor_new(input, &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(editor);
+
+    GtkWidget *save_switch = find_active_switch(GTK_WIDGET(nm_vpn_editor_get_widget(editor)));
+    g_assert_nonnull(save_switch);
+    gtk_switch_set_active(GTK_SWITCH(save_switch), FALSE);
+
+    g_autoptr(NMConnection) output = nm_simple_connection_new();
+    g_assert_true(nm_vpn_editor_update_connection(editor, output, &error));
+    g_assert_no_error(error);
+
+    NMSettingVpn *s_vpn = nm_connection_get_setting_vpn(output);
+    g_assert_nonnull(s_vpn);
+    assert_password_flags(s_vpn, NM_SETTING_SECRET_FLAG_NOT_SAVED);
     g_assert_null(nm_setting_vpn_get_secret(s_vpn, NM_OPENFORTIVPN_KEY_PASSWORD));
 }
 
@@ -197,6 +249,10 @@ main(int argc, char **argv)
                     test_saved_password_becomes_agent_owned);
     g_test_add_func("/openfortivpn/editor/agent-owned-password-stays-agent-owned",
                     test_agent_owned_password_stays_agent_owned);
+    g_test_add_func("/openfortivpn/editor/agent-owned-password-is-carried-through",
+                    test_agent_owned_password_is_carried_through);
+    g_test_add_func("/openfortivpn/editor/turning-off-save-drops-password",
+                    test_turning_off_save_drops_password);
     g_test_add_func("/openfortivpn/editor/not-saved-password-stays-not-saved",
                     test_not_saved_password_stays_not_saved);
 

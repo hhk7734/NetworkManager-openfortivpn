@@ -25,6 +25,8 @@ struct _NMOpenfortivpnEditor {
     GtkSwitch   *save_password_switch;
     GtkEditable *trusted_cert_entry;
     GtkSwitch   *insecure_switch;
+
+    char        *password;        /* secret loaded with the connection, if any */
 };
 
 G_DEFINE_TYPE_WITH_CODE(NMOpenfortivpnEditor, nm_openfortivpn_editor, G_TYPE_OBJECT,
@@ -67,6 +69,8 @@ load_from_connection(NMOpenfortivpnEditor *self, NMConnection *connection)
                                 NULL);
     gtk_switch_set_active(self->save_password_switch,
                           !(flags & NM_SETTING_SECRET_FLAG_NOT_SAVED));
+
+    self->password = g_strdup(nm_setting_vpn_get_secret(s_vpn, NM_OPENFORTIVPN_KEY_PASSWORD));
 }
 
 static void
@@ -112,12 +116,19 @@ update_connection(NMVpnEditor *iface, NMConnection *connection, G_GNUC_UNUSED GE
     if (gtk_switch_get_active(self->insecure_switch))
         nm_setting_vpn_add_data_item(s_vpn, NM_OPENFORTIVPN_KEY_INSECURE_SSL, "yes");
 
+    gboolean save_password = gtk_switch_get_active(self->save_password_switch);
     nm_setting_set_secret_flags(NM_SETTING(s_vpn),
                                 NM_OPENFORTIVPN_KEY_PASSWORD,
-                                gtk_switch_get_active(self->save_password_switch)
+                                save_password
                                     ? NM_SETTING_SECRET_FLAG_AGENT_OWNED
                                     : NM_SETTING_SECRET_FLAG_NOT_SAVED,
                                 NULL);
+
+    /* Hand back the saved password. On a secret-less update NetworkManager
+     * asks the GNOME agent to save no password, and the agent deletes the
+     * keyring item before writing. */
+    if (save_password && self->password && *self->password)
+        nm_setting_vpn_add_secret(s_vpn, NM_OPENFORTIVPN_KEY_PASSWORD, self->password);
 
     nm_connection_add_setting(connection, NM_SETTING(g_steal_pointer(&s_vpn)));
     return TRUE;
@@ -185,7 +196,16 @@ nm_openfortivpn_editor_dispose(GObject *obj)
 }
 
 static void
+nm_openfortivpn_editor_finalize(GObject *obj)
+{
+    NMOpenfortivpnEditor *self = NM_OPENFORTIVPN_EDITOR(obj);
+    g_free(self->password);
+    G_OBJECT_CLASS(nm_openfortivpn_editor_parent_class)->finalize(obj);
+}
+
+static void
 nm_openfortivpn_editor_class_init(NMOpenfortivpnEditorClass *klass)
 {
-    G_OBJECT_CLASS(klass)->dispose = nm_openfortivpn_editor_dispose;
+    G_OBJECT_CLASS(klass)->dispose  = nm_openfortivpn_editor_dispose;
+    G_OBJECT_CLASS(klass)->finalize = nm_openfortivpn_editor_finalize;
 }
