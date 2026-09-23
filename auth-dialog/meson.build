@@ -17,3 +17,10 @@ test(
   find_program('test-old-style-output.sh'),
   args: [auth_dialog],
 )
+
+readelf_prog = find_program('readelf', required: false)
+if readelf_prog.found()
+  test('auth-dialog-read-only-secrets',
+       find_program('test-read-only-secrets.sh'),
+       args: [readelf_prog.full_path(), auth_dialog])
+endif
