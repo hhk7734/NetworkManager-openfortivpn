@@ -6,13 +6,19 @@
  *   - subclass NMVpnServicePlugin to claim the D-Bus name
  *   - on Connect, spawn openfortivpn with config built from NMSettingVpn data
  *   - on tunnel-up (parsed from openfortivpn stdout), publish a stub IP4Config
- *   - on disconnect or child exit, transition to STOPPED
+ *   - on disconnect or child exit, transition to STOPPED; the process stays
+ *     until openfortivpn has exited, killing it if SIGINT isn't enough
  *
  * The skeleton intentionally does NOT yet ship a pppd plugin; IP4Config push
  * here is best-effort and will need to be replaced for production use.
  */
 
 #include "config.h"
+
+#ifdef OPENFORTIVPN_TEST_PATH
+#undef OPENFORTIVPN_PATH
+#define OPENFORTIVPN_PATH OPENFORTIVPN_TEST_PATH
+#endif
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -32,15 +38,22 @@
 #include "nm-openfortivpn-service-defines.h"
 #include "utils.h"
 
+/* How long openfortivpn gets to log out and exit after SIGINT before SIGKILL.
+ * Killing it closes pppd's pty, so pppd still hangs up and removes the link. */
+#define CHILD_KILL_TIMEOUT_SEC 5
+
 /* --- plugin object ------------------------------------------------------- */
 
 struct _NMOpenfortivpnPlugin {
     NMVpnServicePlugin parent;
 
-    GSubprocess  *child;            /* openfortivpn subprocess */
-    GCancellable *cancellable;      /* aborts stdout reader on disconnect */
+    GSubprocess  *child;            /* openfortivpn subprocess, until it exits */
+    GCancellable *cancellable;      /* aborts stdout reader on dispose */
     GDataInputStream *child_stdout; /* line-buffered reader for child stderr+stdout */
+    gboolean      stopping;         /* disconnect requested; child told to exit */
+    guint         kill_timeout_id;  /* SIGKILL fallback while stopping */
     char         *gateway;          /* configured FQDN, e.g. "vpn.moreh.dev" */
+    char         *tundev;           /* from "Interface pppN is UP", e.g. "ppp1" */
 
     /* Parsed from openfortivpn's "Got addresses: [..], ns [..]" line. Used to
      * build the IP4Config we hand to NetworkManager when the tunnel is up. */
@@ -49,6 +62,9 @@ struct _NMOpenfortivpnPlugin {
 };
 
 G_DEFINE_TYPE(NMOpenfortivpnPlugin, nm_openfortivpn_plugin, NM_TYPE_VPN_SERVICE_PLUGIN)
+
+enum { SIGNAL_CHILD_EXITED, N_SIGNALS };
+static guint signals[N_SIGNALS];
 
 /* --- helpers ------------------------------------------------------------- */
 
@@ -147,6 +163,21 @@ parse_got_addresses(NMOpenfortivpnPlugin *self, const char *line)
     self->dns_list = g_strsplit(ns, ", ", 0);
 }
 
+/* Parse "...Interface ppp1 is UP." -- openfortivpn picks the next free pppN,
+ * so a second tunnel (or a leftover one) isn't on ppp0. */
+static void
+parse_interface_up(NMOpenfortivpnPlugin *self, const char *line)
+{
+    const char *p = strstr(line, "Interface ");
+    if (!p) return;
+    p += strlen("Interface ");
+    const char *end = strstr(p, " is UP");
+    if (!end || end == p) return;
+
+    g_clear_pointer(&self->tundev, g_free);
+    self->tundev = g_strndup(p, end - p);
+}
+
 /* Build and emit the IP4Config NetworkManager expects when the tunnel comes
  * up. All IPv4 addresses must be packed as uint32 in network byte order —
  * passing them as strings (as the earlier skeleton did) made NM silently
@@ -159,9 +190,11 @@ publish_ip4_config(NMOpenfortivpnPlugin *self)
 
     g_variant_builder_init(&b, G_VARIANT_TYPE_VARDICT);
 
+    if (!self->tundev)
+        g_warning("openfortivpn: tunnel device wasn't parsed; assuming ppp0");
     g_variant_builder_add(&b, "{sv}",
                           NM_VPN_PLUGIN_IP4_CONFIG_TUNDEV,
-                          g_variant_new_string("ppp0"));
+                          g_variant_new_string(self->tundev ? self->tundev : "ppp0"));
 
     /* Resolve the VPN endpoint FQDN to an IPv4 — NM uses this to install a
      * host route to the gateway through the original (non-VPN) interface so
@@ -250,11 +283,20 @@ on_child_line(GObject *src, GAsyncResult *res, gpointer user_data)
     fprintf(stderr, "openfortivpn: %s\n", line);
     fflush(stderr);
 
+    /* Keep draining while stopping so openfortivpn's teardown never blocks on
+     * a full pipe, but its errors no longer mean the connection failed. */
+    if (self->stopping) {
+        child_read_line_async(self);
+        return;
+    }
+
     /* Capture the address line before the tunnel-up line so the IP4Config
      * we build has something to fill in. openfortivpn prints "Got addresses"
      * a few milliseconds before "Tunnel is up and running". */
     if (strstr(line, "Got addresses: [")) {
         parse_got_addresses(self, line);
+    } else if (strstr(line, "Interface ") && strstr(line, " is UP")) {
+        parse_interface_up(self, line);
     } else if (strstr(line, "Tunnel is up and running")) {
         publish_ip4_config(self);
     } else if (strstr(line, "ERROR:") || strstr(line, "authentication failed")) {
@@ -280,20 +322,58 @@ child_read_line_async(NMOpenfortivpnPlugin *self)
 static void
 on_child_exited(GObject *src, GAsyncResult *res, gpointer user_data)
 {
-    NMOpenfortivpnPlugin *self = NM_OPENFORTIVPN_PLUGIN(user_data);
+    g_autoptr(NMOpenfortivpnPlugin) self = NM_OPENFORTIVPN_PLUGIN(user_data);
     g_autoptr(GError) error = NULL;
+    gboolean ok = g_subprocess_wait_check_finish(G_SUBPROCESS(src), res, &error);
 
-    if (!g_subprocess_wait_check_finish(G_SUBPROCESS(src), res, &error)) {
-        /* If we cancelled the child during disconnect, that's expected. */
-        if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+    g_clear_handle_id(&self->kill_timeout_id, g_source_remove);
+    g_clear_object(&self->child);
+
+    if (!self->stopping) {
+        /* openfortivpn went away on its own: the connection is over. */
+        if (!ok)
             openfortivpn_fail(self, NM_VPN_PLUGIN_FAILURE_CONNECT_FAILED,
-                          "openfortivpn exited: %s", error->message);
-            return;
-        }
+                              "openfortivpn exited: %s", error->message);
+        else
+            nm_vpn_service_plugin_disconnect(NM_VPN_SERVICE_PLUGIN(self), NULL);
     }
-    /* Child exited normally (or due to us cancelling). Ask the base class to
-     * transition into STOPPING -> STOPPED. */
-    nm_vpn_service_plugin_disconnect(NM_VPN_SERVICE_PLUGIN(self), NULL);
+
+    g_signal_emit(self, signals[SIGNAL_CHILD_EXITED], 0);
+}
+
+static gboolean
+on_kill_timeout(gpointer user_data)
+{
+    NMOpenfortivpnPlugin *self = NM_OPENFORTIVPN_PLUGIN(user_data);
+
+    self->kill_timeout_id = 0;
+    if (self->child) {
+        g_warning("openfortivpn didn't exit %d s after SIGINT; killing it",
+                  CHILD_KILL_TIMEOUT_SEC);
+        g_subprocess_force_exit(self->child);
+    }
+    return G_SOURCE_REMOVE;
+}
+
+/* Ask openfortivpn to log out and exit. on_child_exited() reports when it
+ * has; if it's still there after CHILD_KILL_TIMEOUT_SEC it is killed. */
+static void
+stop_child(NMOpenfortivpnPlugin *self)
+{
+    if (!self->child || self->stopping)
+        return;
+
+    self->stopping = TRUE;
+    /* SIGINT lets openfortivpn unwind cleanly (logout, route removal). */
+    g_subprocess_send_signal(self->child, SIGINT);
+    self->kill_timeout_id = g_timeout_add_seconds(CHILD_KILL_TIMEOUT_SEC,
+                                                  on_kill_timeout, self);
+}
+
+gboolean
+nm_openfortivpn_plugin_has_child(NMOpenfortivpnPlugin *self)
+{
+    return self->child != NULL;
 }
 
 static gboolean
@@ -339,10 +419,11 @@ spawn_openfortivpn(NMOpenfortivpnPlugin *self,
     self->child_stdout = g_data_input_stream_new(child_out);
     child_read_line_async(self);
 
+    /* Not cancellable: the exit is what tells us the tunnel is gone. */
     g_subprocess_wait_check_async(self->child,
-                                  self->cancellable,
+                                  NULL,
                                   on_child_exited,
-                                  self);
+                                  g_object_ref(self));
     return TRUE;
 }
 
@@ -404,15 +485,7 @@ openfortivpn_need_secrets(G_GNUC_UNUSED NMVpnServicePlugin *plugin,
 static gboolean
 openfortivpn_disconnect(NMVpnServicePlugin *plugin, G_GNUC_UNUSED GError **error)
 {
-    NMOpenfortivpnPlugin *self = NM_OPENFORTIVPN_PLUGIN(plugin);
-
-    if (self->cancellable)
-        g_cancellable_cancel(self->cancellable);
-
-    if (self->child) {
-        /* SIGINT lets openfortivpn unwind cleanly (logout, route removal). */
-        g_subprocess_send_signal(self->child, SIGINT);
-    }
+    stop_child(NM_OPENFORTIVPN_PLUGIN(plugin));
     return TRUE;
 }
 
@@ -429,13 +502,16 @@ nm_openfortivpn_plugin_dispose(GObject *obj)
     if (self->cancellable)
         g_cancellable_cancel(self->cancellable);
 
+    /* Last resort: main() waits for the child, so it should be gone here. */
     if (self->child)
-        g_subprocess_send_signal(self->child, SIGINT);
+        g_subprocess_force_exit(self->child);
 
+    g_clear_handle_id(&self->kill_timeout_id, g_source_remove);
     g_clear_object(&self->child_stdout);
     g_clear_object(&self->child);
     g_clear_object(&self->cancellable);
     g_clear_pointer(&self->gateway,    g_free);
+    g_clear_pointer(&self->tundev,     g_free);
     g_clear_pointer(&self->local_addr, g_free);
     g_clear_pointer(&self->dns_list,   g_strfreev);
 
@@ -449,6 +525,14 @@ nm_openfortivpn_plugin_class_init(NMOpenfortivpnPluginClass *klass)
     NMVpnServicePluginClass *vpn_class = NM_VPN_SERVICE_PLUGIN_CLASS(klass);
 
     gobject_class->dispose = nm_openfortivpn_plugin_dispose;
+
+    /* Emitted once openfortivpn has exited, however it ended. */
+    signals[SIGNAL_CHILD_EXITED] =
+        g_signal_new("child-exited",
+                     G_TYPE_FROM_CLASS(klass),
+                     G_SIGNAL_RUN_LAST,
+                     0, NULL, NULL, NULL,
+                     G_TYPE_NONE, 0);
     vpn_class->connect      = openfortivpn_connect;
     vpn_class->need_secrets = openfortivpn_need_secrets;
     vpn_class->disconnect   = openfortivpn_disconnect;
@@ -472,6 +556,7 @@ static char    *opt_bus_name = NULL;
 typedef struct {
     GMainLoop             *loop;
     NMOpenfortivpnPlugin  *plugin;
+    gboolean               stopped;   /* plugin reached STOPPED or was told to quit */
 } RuntimeCtx;
 
 static GOptionEntry option_entries[] = {
@@ -484,12 +569,27 @@ static GOptionEntry option_entries[] = {
     { NULL }
 };
 
+/* Exit only once openfortivpn is gone too, so it's never left running
+ * without the service that would stop it. */
+static void
+maybe_quit(RuntimeCtx *ctx)
+{
+    if (ctx->stopped && !nm_openfortivpn_plugin_has_child(ctx->plugin))
+        g_main_loop_quit(ctx->loop);
+}
+
+static void
+stop_and_quit(RuntimeCtx *ctx)
+{
+    openfortivpn_disconnect(NM_VPN_SERVICE_PLUGIN(ctx->plugin), NULL);
+    ctx->stopped = TRUE;
+    maybe_quit(ctx);
+}
+
 static gboolean
 on_term(gpointer user_data)
 {
-    RuntimeCtx *ctx = user_data;
-    openfortivpn_disconnect(NM_VPN_SERVICE_PLUGIN(ctx->plugin), NULL);
-    g_main_loop_quit(ctx->loop);
+    stop_and_quit(user_data);
     return G_SOURCE_REMOVE;
 }
 
@@ -498,11 +598,8 @@ on_nm_vanished(G_GNUC_UNUSED GDBusConnection *connection,
                const char      *name,
                gpointer         user_data)
 {
-    RuntimeCtx *ctx = user_data;
-
     g_message("%s disappeared; stopping openfortivpn service", name);
-    openfortivpn_disconnect(NM_VPN_SERVICE_PLUGIN(ctx->plugin), NULL);
-    g_main_loop_quit(ctx->loop);
+    stop_and_quit(user_data);
 }
 
 static void
@@ -510,10 +607,24 @@ on_state_changed(G_GNUC_UNUSED NMVpnServicePlugin *plugin,
                  NMVpnServiceState state,
                  gpointer user_data)
 {
-    GMainLoop *loop = user_data;
+    RuntimeCtx *ctx = user_data;
 
-    if (state == NM_VPN_SERVICE_STATE_STOPPED)
-        g_main_loop_quit(loop);
+    if (state == NM_VPN_SERVICE_STATE_STOPPED) {
+        ctx->stopped = TRUE;
+        maybe_quit(ctx);
+    }
+}
+
+static void
+on_quit(G_GNUC_UNUSED NMVpnServicePlugin *plugin, gpointer user_data)
+{
+    stop_and_quit(user_data);
+}
+
+static void
+on_child_exited_quit(G_GNUC_UNUSED NMOpenfortivpnPlugin *plugin, gpointer user_data)
+{
+    maybe_quit(user_data);
 }
 
 int
@@ -542,13 +653,16 @@ main(int argc, char *argv[])
         ? g_strdup(opt_bus_name)
         : g_strdup(NM_DBUS_SERVICE_OPENFORTIVPN);
 
+    /* Declared before the plugin so it's freed after it: the plugin's
+     * handlers use the loop until they're disconnected below. */
+    g_autoptr(GMainLoop) loop = g_main_loop_new(NULL, FALSE);
+
     g_autoptr(NMOpenfortivpnPlugin) plugin = nm_openfortivpn_plugin_new(bus_name, &error);
     if (!plugin) {
         g_printerr("Failed to claim %s: %s\n", bus_name, error->message);
         return EXIT_FAILURE;
     }
 
-    g_autoptr(GMainLoop) loop = g_main_loop_new(NULL, FALSE);
     RuntimeCtx runtime = {
         .loop = loop,
         .plugin = plugin,
@@ -565,12 +679,17 @@ main(int argc, char *argv[])
                                          &runtime,
                                          NULL);
 
+    g_signal_connect(plugin, "child-exited", G_CALLBACK(on_child_exited_quit), &runtime);
     if (!opt_persist) {
-        g_signal_connect_swapped(plugin, "quit", G_CALLBACK(g_main_loop_quit), loop);
-        g_signal_connect(plugin, "state-changed", G_CALLBACK(on_state_changed), loop);
+        g_signal_connect(plugin, "quit", G_CALLBACK(on_quit), &runtime);
+        g_signal_connect(plugin, "state-changed", G_CALLBACK(on_state_changed), &runtime);
     }
 
     g_main_loop_run(loop);
     g_bus_unwatch_name(nm_watch_id);
+
+    /* The handlers point at the stack-allocated runtime; drop them before the
+     * plugin's dispose emits state-changed on its way out. */
+    g_signal_handlers_disconnect_by_data(plugin, &runtime);
     return EXIT_SUCCESS;
 }
