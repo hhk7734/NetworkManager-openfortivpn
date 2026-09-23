@@ -12,6 +12,7 @@ G_DECLARE_FINAL_TYPE(NMOpenfortivpnPlugin, nm_openfortivpn_plugin,
                     NM, OPENFORTIVPN_PLUGIN, NMVpnServicePlugin)
 
 NMOpenfortivpnPlugin *nm_openfortivpn_plugin_new(const char *bus_name, GError **error);
+gboolean nm_openfortivpn_plugin_has_child(NMOpenfortivpnPlugin *self);
 
 G_END_DECLS
 

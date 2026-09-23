@@ -40,6 +40,11 @@ description = "Run the test suite"
 depends = ["build"]
 run = 'meson test -C "$BUILDDIR" --print-errorlogs'
 
+[tasks."test:service"]
+description = "Run the service lifecycle test (needs passwordless sudo)"
+depends = ["build"]
+run = 'NM_OPENFORTIVPN_ROOT_TESTS=1 meson test -C "$BUILDDIR" --print-errorlogs service-lifecycle'
+
 [tasks.install]
 description = "Install the plugin and restart NetworkManager"
 depends = ["build"]

@@ -1,0 +1,28 @@
+#!/bin/bash
+# Stand-in for openfortivpn used by test-service-lifecycle.sh. It prints the
+# lines the service parses and records the signals it receives in $FAKE_LOG.
+#
+#   FAKE_LOG       file to append events to (required)
+#   FAKE_TUNDEV    interface name to announce (default ppp7)
+#   FAKE_STUBBORN  when 1, ignore SIGINT and SIGTERM like a stuck teardown
+
+log() { echo "$1" >> "$FAKE_LOG"; }
+
+log "start $$"
+if [ "${FAKE_STUBBORN:-0}" = 1 ]; then
+  trap 'log "ignored INT"' INT
+  trap 'log "ignored TERM"' TERM
+else
+  trap 'log "got INT"; exit 0' INT
+  trap 'log "got TERM"; exit 0' TERM
+fi
+
+read -r _password
+echo "VPN account password:"
+echo "INFO:   Connected to gateway."
+echo "INFO:   Got addresses: [10.9.9.2], ns [10.9.9.53]"
+echo "INFO:   Interface ${FAKE_TUNDEV:-ppp7} is UP."
+echo "INFO:   Tunnel is up and running."
+
+# Sleep in the background so traps run as soon as a signal arrives.
+while :; do sleep 0.2 & wait $!; done
