@@ -15,8 +15,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <glib.h>
+#include <gio/gunixoutputstream.h>
 #include <gtk/gtk.h>
 #include <adwaita.h>
 #include <NetworkManager.h>
@@ -24,6 +26,7 @@
 #include <libsecret/secret.h>
 
 #include "nm-openfortivpn-service-defines.h"
+#include "password-choice.h"
 
 #define UI_KEYFILE_GROUP "VPN Plugin UI"
 #define KEYRING_UUID_TAG "connection-uuid"
@@ -38,6 +41,8 @@ static char    *opt_service    = NULL;
 static gboolean opt_reprompt   = FALSE;
 static gboolean opt_allow_interaction = FALSE;
 static gboolean opt_external_ui = FALSE;
+static char    *opt_update_password_choice = NULL;
+static gboolean opt_save_password = FALSE;
 
 static GOptionEntry option_entries[] = {
     { "uuid",    'u', 0, G_OPTION_ARG_STRING, &opt_uuid,    "Connection UUID",    "UUID" },
@@ -46,6 +51,11 @@ static GOptionEntry option_entries[] = {
     { "reprompt", 'r', 0, G_OPTION_ARG_NONE,  &opt_reprompt, "Force re-prompt",   NULL },
     { "allow-interaction", 'i', 0, G_OPTION_ARG_NONE, &opt_allow_interaction,
       "GUI interaction is permitted", NULL },
+    /* Internal: the delayed helper that records the "Save password" choice. */
+    { "update-password-choice", 0, G_OPTION_FLAG_HIDDEN, G_OPTION_ARG_STRING,
+      &opt_update_password_choice, NULL, NULL },
+    { "save-password", 0, G_OPTION_FLAG_HIDDEN, G_OPTION_ARG_NONE,
+      &opt_save_password, NULL, NULL },
     { "external-ui-mode", 0, 0, G_OPTION_ARG_NONE, &opt_external_ui,
       "External UI mode (unsupported in v1)", NULL },
     { NULL }
@@ -54,9 +64,8 @@ static GOptionEntry option_entries[] = {
 /* --- user keyring lookup ------------------------------------------------ *
  *
  * Read-only. The secret agent (gnome-shell, nm-applet) owns the keyring: it
- * saves agent-owned secrets this dialog returns. Writing the keyring or the
- * connection from here makes the agent delete the saved password, because its
- * save deletes every item for the connection before writing what it was given. */
+ * saves agent-owned secrets this dialog returns, and its save deletes every
+ * item for the connection before writing what it was given. */
 
 static const SecretSchema openfortivpn_secret_schema = {
     .name = "org.freedesktop.NetworkManager.Connection",
@@ -95,6 +104,117 @@ lookup_saved_password(const char *uuid)
         g_debug("failed to lookup saved password: %s", error->message);
 
     return password;
+}
+
+/* --- "Save password" choice --------------------------------------------- *
+ *
+ * The choice is stored as the connection's password flag, which only a
+ * connection update can change. That runs in a detached helper after this
+ * dialog has exited, because the agent saves the returned secrets right after
+ * the dialog exits, using the flag from before the prompt: its delete-first
+ * save must come before ours. The helper gets the password on a pipe, since
+ * argv is visible to other users. */
+
+#define PASSWORD_CHOICE_DELAY_SEC 2
+
+typedef struct {
+    GMainLoop *loop;
+} UpdateCtx;
+
+static void
+on_connection_updated(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+    UpdateCtx *ctx = user_data;
+    g_autoptr(GError) error = NULL;
+    g_autoptr(GVariant) result =
+        nm_remote_connection_update2_finish(NM_REMOTE_CONNECTION(source), res, &error);
+
+    if (!result)
+        g_warning("failed to save the password choice: %s",
+                  error ? error->message : "unknown error");
+    g_main_loop_quit(ctx->loop);
+}
+
+static int
+run_password_choice_helper(const char *uuid, gboolean save)
+{
+    g_autofree char *password = NULL;
+    if (save) {
+        char buf[4096];
+        if (!fgets(buf, sizeof buf, stdin))
+            return EXIT_FAILURE;
+        buf[strcspn(buf, "\n")] = '\0';
+        password = g_strdup(buf);
+        explicit_bzero(buf, sizeof buf);
+    }
+
+    g_usleep(PASSWORD_CHOICE_DELAY_SEC * G_USEC_PER_SEC);
+
+    g_autoptr(GError) error = NULL;
+    g_autoptr(NMClient) client = nm_client_new(NULL, &error);
+    if (!client) {
+        g_warning("failed to reach NetworkManager: %s", error->message);
+        return EXIT_FAILURE;
+    }
+
+    NMRemoteConnection *remote = nm_client_get_connection_by_uuid(client, uuid);
+    NMSettingVpn *s_vpn = remote ? nm_connection_get_setting_vpn(NM_CONNECTION(remote)) : NULL;
+    if (!s_vpn) {
+        g_warning("connection %s has no VPN setting", uuid);
+        return EXIT_FAILURE;
+    }
+
+    gboolean update = nm_openfortivpn_apply_password_choice(s_vpn, save, password);
+    if (password)
+        explicit_bzero(password, strlen(password));
+    if (!update)
+        return EXIT_SUCCESS;
+
+    g_autoptr(GMainLoop) loop = g_main_loop_new(NULL, FALSE);
+    UpdateCtx ctx = { .loop = loop };
+    nm_remote_connection_update2(remote,
+                                 nm_connection_to_dbus(NM_CONNECTION(remote),
+                                                       NM_CONNECTION_SERIALIZE_ALL),
+                                 0, NULL, NULL,
+                                 on_connection_updated, &ctx);
+    g_main_loop_run(loop);
+    return EXIT_SUCCESS;
+}
+
+static void
+spawn_password_choice_helper(const char *uuid, gboolean save, const char *password)
+{
+    if (!uuid || !*uuid)
+        return;
+
+    const char *self = LIBEXECDIR "/nm-openfortivpn-auth-dialog";
+    const char *prgname = g_get_prgname();
+    if (prgname && g_path_is_absolute(prgname))
+        self = prgname;
+
+    const char *argv[] = {
+        self, "--update-password-choice", uuid,
+        save ? "--save-password" : NULL,
+        NULL,
+    };
+    g_autoptr(GError) error = NULL;
+    int stdin_fd = -1;
+
+    if (!g_spawn_async_with_pipes(NULL, (char **) argv, NULL,
+                                  G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL,
+                                  NULL, NULL, NULL,
+                                  &stdin_fd, NULL, NULL, &error)) {
+        g_warning("failed to start the password choice helper: %s", error->message);
+        return;
+    }
+
+    if (save) {
+        g_autoptr(GOutputStream) out = g_unix_output_stream_new(stdin_fd, TRUE);
+        g_output_stream_write_all(out, password, strlen(password), NULL, NULL, NULL);
+        g_output_stream_write_all(out, "\n", 1, NULL, NULL, NULL);
+    } else {
+        close(stdin_fd);
+    }
 }
 
 /* --- external UI mode ---------------------------------------------------- */
@@ -138,9 +258,11 @@ typedef struct {
     GMainLoop *loop;
     GtkWindow *window;
     char      *password;
+    gboolean   save_password;
     gboolean   accepted;
     gboolean   completed;
     GtkEditable *entry;
+    GtkCheckButton *save_check;
 } PromptCtx;
 
 static void
@@ -150,8 +272,10 @@ finish_prompt(PromptCtx *ctx, gboolean accepted)
         return;
     ctx->completed = TRUE;
     ctx->accepted = accepted;
-    if (accepted)
+    if (accepted) {
         ctx->password = g_strdup(gtk_editable_get_text(ctx->entry));
+        ctx->save_password = gtk_check_button_get_active(ctx->save_check);
+    }
     if (ctx->window)
         gtk_window_destroy(ctx->window);
     g_main_loop_quit(ctx->loop);
@@ -184,7 +308,9 @@ on_entry_activate(G_GNUC_UNUSED GtkWidget *entry, gpointer user_data)
 
 static char *
 prompt_for_password(const char *connection_name,
-                    const char *user)
+                    const char *user,
+                    gboolean    initial_save,
+                    gboolean   *out_save)
 {
     PromptCtx ctx = { .loop = g_main_loop_new(NULL, FALSE) };
 
@@ -224,6 +350,11 @@ prompt_for_password(const char *connection_name,
     g_signal_connect(entry, "activate", G_CALLBACK(on_entry_activate), &ctx);
     gtk_box_append(GTK_BOX(box), entry);
 
+    GtkWidget *save_check = gtk_check_button_new_with_mnemonic("_Save password");
+    ctx.save_check = GTK_CHECK_BUTTON(save_check);
+    gtk_check_button_set_active(ctx.save_check, initial_save);
+    gtk_box_append(GTK_BOX(box), save_check);
+
     GtkWidget *actions = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_widget_set_halign(actions, GTK_ALIGN_END);
     gtk_box_append(GTK_BOX(box), actions);
@@ -244,6 +375,7 @@ prompt_for_password(const char *connection_name,
 
     g_main_loop_run(ctx.loop);
 
+    *out_save = ctx.save_password;
     g_main_loop_unref(ctx.loop);
     return ctx.accepted ? ctx.password : NULL;
 }
@@ -284,6 +416,9 @@ main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    if (opt_update_password_choice)
+        return run_password_choice_helper(opt_update_password_choice, opt_save_password);
+
     g_autoptr(GHashTable) data = NULL, secrets = NULL;
     if (!nm_vpn_service_plugin_read_vpn_details(0 /* stdin */, &data, &secrets)) {
         g_printerr("nm-openfortivpn-auth-dialog: failed to read VPN details from stdin\n");
@@ -313,6 +448,8 @@ main(int argc, char *argv[])
     }
 
     g_autofree char *password = NULL;
+    gboolean prompted = FALSE;
+    gboolean save_password = FALSE;
     if (existing && *existing && !opt_reprompt)
         password = g_strdup(existing);
     else if (!opt_reprompt && !(password_flags & NM_SETTING_SECRET_FLAG_NOT_SAVED))
@@ -320,9 +457,12 @@ main(int argc, char *argv[])
 
     if (!password && opt_allow_interaction) {
         adw_init();
-        password = prompt_for_password(opt_name, user);
+        password = prompt_for_password(opt_name, user,
+                                       !(password_flags & NM_SETTING_SECRET_FLAG_NOT_SAVED),
+                                       &save_password);
         if (!password)
             return EXIT_FAILURE;   /* user cancelled */
+        prompted = TRUE;
     }
 
     if (!password) {
@@ -336,6 +476,8 @@ main(int argc, char *argv[])
     fflush(stdout);
 
     wait_for_quit();
+    if (prompted)
+        spawn_password_choice_helper(opt_uuid, save_password, password);
 
     return EXIT_SUCCESS;
 }
