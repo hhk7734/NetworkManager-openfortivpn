@@ -44,19 +44,20 @@ The install places the following files on disk:
 
 ## Passwords
 
-Whether the password is saved is set per connection with **Save password** in
-the connection editor:
+Whether the password is saved is set per connection, with **Save password** in
+the password prompt or in the connection editor:
 
-- **On** (`password-flags=1`, agent-owned): the first password you type is saved
-  to your login keyring by your secret agent (GNOME Shell or nm-applet) and
-  reused on later connects.
-- **Off** (`password-flags=2`, not saved): you are asked every time.
+- **On** (`password-flags=1`, agent-owned): the password is saved to your login
+  keyring by your secret agent (GNOME Shell or nm-applet) and reused on later
+  connects.
+- **Off** (`password-flags=2`, not saved): you are asked every time, and a
+  previously saved password is removed.
 
-The auth dialog never writes the keyring or the connection. Any update that
-carries no password makes the GNOME agent delete the saved one, so change a
-connection with the password included, or while it is connected. A plain
-`nmcli connection modify` of a disconnected connection also removes the saved
-password.
+The prompt records your choice a couple of seconds after it closes, by
+updating the connection with the password included. It never writes the
+keyring itself. Any update that carries no password makes the GNOME agent
+delete the saved one, so a plain `nmcli connection modify` of a disconnected
+connection also removes the saved password.
 
 ## Uninstall
 
