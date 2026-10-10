@@ -42,22 +42,89 @@ The install places the following files on disk:
 /usr/lib/<triplet>/NetworkManager/libnm-openfortivpn-properties.so    GTK4 properties editor
 ```
 
-## Passwords
+## Using nmcli
 
-Whether the password is saved is set per connection, with **Save password** in
-the password prompt or in the connection editor:
+Everything the connection editor does can also be done from a terminal.
 
-- **On** (`password-flags=1`, agent-owned): the password is saved to your login
-  keyring by your secret agent (GNOME Shell or nm-applet) and reused on later
-  connects.
-- **Off** (`password-flags=2`, not saved): you are asked every time, and a
-  previously saved password is removed.
+Create a connection:
 
-The prompt records your choice a couple of seconds after it closes, by
-updating the connection with the password included. It never writes the
-keyring itself. Any update that carries no password makes the GNOME agent
-delete the saved one, so a plain `nmcli connection modify` of a disconnected
-connection also removes the saved password.
+```sh
+nmcli connection add type vpn ifname '*' \
+  con-name <name> \
+  vpn-type openfortivpn \
+  vpn.data 'gateway=<gateway>,port=443,user=<username>'
+```
+
+Connect, typing the password in the terminal:
+
+```sh
+nmcli connection up <name> --ask
+```
+
+Disconnect, inspect, and delete:
+
+```sh
+nmcli connection down <name>
+nmcli connection show <name> | grep '^vpn\.'
+nmcli connection delete <name>
+```
+
+### Connection options
+
+All options live in `vpn.data`:
+
+| Key            | Required | Meaning                                                        |
+| -------------- | -------- | -------------------------------------------------------------- |
+| `gateway`      | yes      | Gateway host name or IP address                                |
+| `user`         | yes      | Username                                                       |
+| `port`         | no       | Gateway port; openfortivpn's default (443) when unset          |
+| `trusted-cert` | no       | SHA-256 digest of the gateway certificate to trust             |
+| `no-dtls`      | no       | `yes` to pass `--no-dtls`                                      |
+| `insecure-ssl` | no       | `yes` to pass `--insecure-ssl`                                 |
+
+Add or change one option without retyping the rest with `+vpn.data`, and
+remove one with `-vpn.data`:
+
+```sh
+nmcli connection modify <name> +vpn.data 'trusted-cert=<sha256-digest>'
+nmcli connection modify <name> -vpn.data trusted-cert
+```
+
+If the gateway certificate is self-signed or not in the system store,
+openfortivpn refuses it and logs the digest to pin; find it with
+`journalctl -u NetworkManager | grep -i trusted-cert`.
+
+### Password storage
+
+`password-flags` in `vpn.data` picks where the password is kept. **Save
+password** in the password prompt or the connection editor switches between
+the first two:
+
+```sh
+# Saved in your login keyring by your secret agent (GNOME Shell or nm-applet)
+nmcli connection modify <name> +vpn.data 'password-flags=1'
+
+# Asked on every connect; a previously saved password is removed
+nmcli connection modify <name> +vpn.data 'password-flags=2'
+```
+
+With `password-flags=1`, any connection update that carries no password makes
+the GNOME agent delete the saved one. That includes a plain `nmcli connection
+modify` while disconnected, so enter the password again on the next connect.
+The prompt itself never writes the keyring; it saves your choice by updating
+the connection, with the password, a couple of seconds after it closes.
+
+For a headless machine with no secret agent, `password-flags=0` lets
+NetworkManager store the password itself, in plain text in the root-only file
+under `/etc/NetworkManager/system-connections/` (the command below also leaves
+it in your shell history):
+
+```sh
+nmcli connection modify <name> \
+  +vpn.data 'password-flags=0' \
+  vpn.secrets 'password=<password>'
+nmcli connection up <name>
+```
 
 ## Uninstall
 
