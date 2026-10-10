@@ -94,20 +94,25 @@ If the gateway certificate is self-signed or not in the system store,
 openfortivpn refuses it and logs the digest to pin; find it with
 `journalctl -u NetworkManager | grep -i trusted-cert`.
 
-Modifying a connection that is not connected deletes its saved password; see
-[Passwords](#passwords).
-
 ### Password storage
 
-`password-flags` in `vpn.data` picks where the password is kept:
+`password-flags` in `vpn.data` picks where the password is kept. **Save
+password** in the password prompt or the connection editor switches between
+the first two:
 
 ```sh
-# Saved in your login keyring (same as checking Save password)
+# Saved in your login keyring by your secret agent (GNOME Shell or nm-applet)
 nmcli connection modify <name> +vpn.data 'password-flags=1'
 
-# Asked on every connect
+# Asked on every connect; a previously saved password is removed
 nmcli connection modify <name> +vpn.data 'password-flags=2'
 ```
+
+With `password-flags=1`, any connection update that carries no password makes
+the GNOME agent delete the saved one. That includes a plain `nmcli connection
+modify` while disconnected, so enter the password again on the next connect.
+The prompt itself never writes the keyring; it saves your choice by updating
+the connection, with the password, a couple of seconds after it closes.
 
 For a headless machine with no secret agent, `password-flags=0` lets
 NetworkManager store the password itself, in plain text in the root-only file
@@ -120,23 +125,6 @@ nmcli connection modify <name> \
   vpn.secrets 'password=<password>'
 nmcli connection up <name>
 ```
-
-## Passwords
-
-Whether the password is saved is set per connection, with **Save password** in
-the password prompt or in the connection editor:
-
-- **On** (`password-flags=1`, agent-owned): the password is saved to your login
-  keyring by your secret agent (GNOME Shell or nm-applet) and reused on later
-  connects.
-- **Off** (`password-flags=2`, not saved): you are asked every time, and a
-  previously saved password is removed.
-
-The prompt records your choice a couple of seconds after it closes, by
-updating the connection with the password included. It never writes the
-keyring itself. Any update that carries no password makes the GNOME agent
-delete the saved one, so a plain `nmcli connection modify` of a disconnected
-connection also removes the saved password.
 
 ## Uninstall
 
