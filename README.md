@@ -42,6 +42,85 @@ The install places the following files on disk:
 /usr/lib/<triplet>/NetworkManager/libnm-openfortivpn-properties.so    GTK4 properties editor
 ```
 
+## Using nmcli
+
+Everything the connection editor does can also be done from a terminal.
+
+Create a connection:
+
+```sh
+nmcli connection add type vpn ifname '*' \
+  con-name <name> \
+  vpn-type openfortivpn \
+  vpn.data 'gateway=<gateway>,port=443,user=<username>'
+```
+
+Connect, typing the password in the terminal:
+
+```sh
+nmcli connection up <name> --ask
+```
+
+Disconnect, inspect, and delete:
+
+```sh
+nmcli connection down <name>
+nmcli connection show <name> | grep '^vpn\.'
+nmcli connection delete <name>
+```
+
+### Connection options
+
+All options live in `vpn.data`:
+
+| Key            | Required | Meaning                                                        |
+| -------------- | -------- | -------------------------------------------------------------- |
+| `gateway`      | yes      | Gateway host name or IP address                                |
+| `user`         | yes      | Username                                                       |
+| `port`         | no       | Gateway port; openfortivpn's default (443) when unset          |
+| `trusted-cert` | no       | SHA-256 digest of the gateway certificate to trust             |
+| `no-dtls`      | no       | `yes` to pass `--no-dtls`                                      |
+| `insecure-ssl` | no       | `yes` to pass `--insecure-ssl`                                 |
+
+Add or change one option without retyping the rest with `+vpn.data`, and
+remove one with `-vpn.data`:
+
+```sh
+nmcli connection modify <name> +vpn.data 'trusted-cert=<sha256-digest>'
+nmcli connection modify <name> -vpn.data trusted-cert
+```
+
+If the gateway certificate is self-signed or not in the system store,
+openfortivpn refuses it and logs the digest to pin; find it with
+`journalctl -u NetworkManager | grep -i trusted-cert`.
+
+Modifying a connection that is not connected deletes its saved password; see
+[Passwords](#passwords).
+
+### Password storage
+
+`password-flags` in `vpn.data` picks where the password is kept:
+
+```sh
+# Saved in your login keyring (same as checking Save password)
+nmcli connection modify <name> +vpn.data 'password-flags=1'
+
+# Asked on every connect
+nmcli connection modify <name> +vpn.data 'password-flags=2'
+```
+
+For a headless machine with no secret agent, `password-flags=0` lets
+NetworkManager store the password itself, in plain text in the root-only file
+under `/etc/NetworkManager/system-connections/` (the command below also leaves
+it in your shell history):
+
+```sh
+nmcli connection modify <name> \
+  +vpn.data 'password-flags=0' \
+  vpn.secrets 'password=<password>'
+nmcli connection up <name>
+```
+
 ## Passwords
 
 Whether the password is saved is set per connection, with **Save password** in
