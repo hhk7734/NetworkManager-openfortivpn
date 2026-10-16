@@ -126,6 +126,31 @@ nmcli connection modify <name> \
 nmcli connection up <name>
 ```
 
+## Reconnecting after the gateway drops the tunnel
+
+If the tunnel goes down on its own once it has been up, for example when the
+gateway ends the session at its time limit, the VPN service restarts
+openfortivpn with the password it was given at connect. It waits 5 s before
+the first attempt and doubles the wait after each one, up to 60 s, until the
+tunnel is back. The wait starts over at 5 s once a tunnel has stayed up for a
+minute.
+
+While it reconnects, NetworkManager shows the VPN as activating
+(`nmcli connection show --active`), and the old interface's address, routes
+and DNS servers go away with it. Once the tunnel is back, NetworkManager
+configures the new interface and shows the VPN as activated again.
+
+This only works while that VPN session is still running:
+
+- `nmcli connection down`, or turning the VPN off in the UI, ends the session
+  and stops any further attempts.
+- If the gateway rejects the login on any attempt, the service stops trying
+  and the VPN fails with "Invalid secrets" (`login-failed` in the
+  NetworkManager log).
+- Once the session has ended, nothing brings it back. That includes the VPN
+  service or NetworkManager exiting or restarting, or the network the VPN runs
+  over going down. Connect again, as you would the first time.
+
 ## Uninstall
 
 `ninja uninstall` reverses everything `meson install` placed on disk — including

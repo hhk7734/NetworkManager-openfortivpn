@@ -1,27 +1,87 @@
 #!/bin/bash
 # Stand-in for openfortivpn used by test-service-lifecycle.sh. It prints the
-# lines the service parses and records the signals it receives in $FAKE_LOG.
+# lines the service parses and records what happens to it in $FAKE_LOG.
 #
-#   FAKE_LOG       file to append events to (required)
-#   FAKE_TUNDEV    interface name to announce (default ppp7)
-#   FAKE_STUBBORN  when 1, ignore SIGINT and SIGTERM like a stuck teardown
+#   FAKE_LOG        file to append events to (required)
+#   FAKE_TUNDEV     interface name to announce (default ppp7)
+#   FAKE_STUBBORN   when 1, ignore SIGINT and SIGTERM like a stuck teardown
+#   FAKE_MODE_FILE  file read at start to pick how this run goes (default up):
+#                     up           bring the tunnel up and keep it
+#                     unreachable  fail to reach the gateway and exit
+#                     reject       have the login rejected and exit
+#   FAKE_NETDEV     when 1, create the interface as a dummy link and delete it
+#                   when the tunnel goes down, so NetworkManager can configure it
+#
+# SIGUSR1 plays the gateway ending the session: the tunnel goes down and the
+# process exits the way openfortivpn does.
 
 log() { echo "$1" >> "$FAKE_LOG"; }
 
+tundev=${FAKE_TUNDEV:-ppp7}
+mode=$(cat "${FAKE_MODE_FILE:-/dev/null}" 2>/dev/null)
+mode=${mode:-up}
+
+link_down() {
+  [ "${FAKE_NETDEV:-0}" = 1 ] && ip link del "$tundev" 2>/dev/null
+}
+
+stop() {
+  log "got $1"
+  link_down
+  exit 0
+}
+
+drop() {
+  log "dropped $(date +%s.%N)"
+  echo "ERROR:  read: Connection reset by peer"
+  echo "INFO:   Cancelling threads..."
+  echo "INFO:   Cleanup, joining threads..."
+  link_down   # pppd exits, taking its interface with it
+  echo "INFO:   Terminated pppd."
+  echo "INFO:   Closed connection to gateway."
+  echo "INFO:   Logged out."
+  exit 1
+}
+
 log "start $$"
+log "time $$ $(date +%s.%N)"
 if [ "${FAKE_STUBBORN:-0}" = 1 ]; then
   trap 'log "ignored INT"' INT
   trap 'log "ignored TERM"' TERM
 else
-  trap 'log "got INT"; exit 0' INT
-  trap 'log "got TERM"; exit 0' TERM
+  trap 'stop INT' INT
+  trap 'stop TERM' TERM
 fi
+trap drop USR1
 
-read -r _password
+read -r password
+log "password $password"
+log "mode $mode"
 echo "VPN account password:"
+
+case $mode in
+  unreachable)
+    echo "ERROR:  connect: Connection refused"
+    echo "INFO:   Closed connection to gateway."
+    echo "INFO:   Could not log out."
+    exit 1
+    ;;
+  reject)
+    echo "INFO:   Connected to gateway."
+    echo "ERROR:  Could not authenticate to gateway. Please check the password, client certificate, etc."
+    echo "INFO:   Closed connection to gateway."
+    echo "INFO:   Logged out."
+    exit 1
+    ;;
+esac
+
 echo "INFO:   Connected to gateway."
+echo "INFO:   Authenticated."
 echo "INFO:   Got addresses: [10.9.9.2], ns [10.9.9.53]"
-echo "INFO:   Interface ${FAKE_TUNDEV:-ppp7} is UP."
+if [ "${FAKE_NETDEV:-0}" = 1 ]; then
+  ip link add "$tundev" type dummy && ip link set "$tundev" up
+fi
+echo "INFO:   Interface $tundev is UP."
 echo "INFO:   Tunnel is up and running."
 
 # Sleep in the background so traps run as soon as a signal arrives.
