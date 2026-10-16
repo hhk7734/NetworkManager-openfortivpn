@@ -16,7 +16,8 @@ test_service = executable(
   dependencies:        [libnm_dep, gio_dep],
   c_args:              ['-DG_LOG_DOMAIN="nm-openfortivpn"',
                         '-DOPENFORTIVPN_TEST_PATH="@0@"'.format(
-                          meson.current_source_dir() / 'test-fake-openfortivpn')],
+                          meson.current_source_dir() / 'test-fake-openfortivpn'),
+                        '-DRECONNECT_DELAY_MIN_SEC=1'],
 )
 
 test('service-lifecycle',

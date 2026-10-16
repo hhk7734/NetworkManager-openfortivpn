@@ -6,8 +6,11 @@
  *   - subclass NMVpnServicePlugin to claim the D-Bus name
  *   - on Connect, spawn openfortivpn with config built from NMSettingVpn data
  *   - on tunnel-up (parsed from openfortivpn stdout), publish a stub IP4Config
- *   - on disconnect or child exit, transition to STOPPED; the process stays
- *     until openfortivpn has exited, killing it if SIGINT isn't enough
+ *   - on losing an established tunnel, report STARTING and restart
+ *     openfortivpn with the session's password until the tunnel is back
+ *   - on disconnect, login rejection or a failed first connect, transition to
+ *     STOPPED; the process stays until openfortivpn has exited, killing it if
+ *     SIGINT isn't enough
  *
  * The skeleton intentionally does NOT yet ship a pppd plugin; IP4Config push
  * here is best-effort and will need to be replaced for production use.
@@ -42,6 +45,15 @@
  * Killing it closes pppd's pty, so pppd still hangs up and removes the link. */
 #define CHILD_KILL_TIMEOUT_SEC 5
 
+/* Wait before restarting openfortivpn after the tunnel is lost, doubled after
+ * each attempt up to RECONNECT_DELAY_MAX_SEC. Back at the minimum once a
+ * tunnel has stayed up for RECONNECT_DELAY_MAX_SEC, so one that drops again
+ * right after each login keeps backing off. */
+#ifndef RECONNECT_DELAY_MIN_SEC
+#define RECONNECT_DELAY_MIN_SEC 5
+#endif
+#define RECONNECT_DELAY_MAX_SEC 60
+
 /* --- plugin object ------------------------------------------------------- */
 
 struct _NMOpenfortivpnPlugin {
@@ -52,6 +64,18 @@ struct _NMOpenfortivpnPlugin {
     GDataInputStream *child_stdout; /* line-buffered reader for child stderr+stdout */
     gboolean      stopping;         /* disconnect requested; child told to exit */
     guint         kill_timeout_id;  /* SIGKILL fallback while stopping */
+    gboolean      failing;          /* report `failure` when the disconnect runs */
+    NMVpnPluginFailure failure;
+
+    /* The session: kept from Connect so a lost tunnel can be restored without
+     * asking NetworkManager for secrets again. Wiped when the session ends. */
+    char        **argv;
+    char         *password;
+    gboolean      tunnel_up;        /* this openfortivpn reported the tunnel up */
+    gboolean      established;      /* the tunnel came up once this session */
+    guint         reconnect_id;     /* pending restart of openfortivpn */
+    guint         reconnect_delay;  /* seconds before the next restart */
+    gint64        up_since;         /* monotonic time the tunnel came up */
     char         *gateway;          /* configured FQDN, e.g. "vpn.moreh.dev" */
     char         *tundev;           /* from "Interface pppN is UP", e.g. "ppp1" */
 
@@ -79,7 +103,23 @@ openfortivpn_fail(NMOpenfortivpnPlugin *self, NMVpnPluginFailure reason, const c
     va_end(ap);
 
     g_warning("%s", msg);
-    nm_vpn_service_plugin_failure(NM_VPN_SERVICE_PLUGIN(self), reason);
+    /* openfortivpn_disconnect() reports the reason. Reporting it here, as
+     * nm_vpn_service_plugin_failure() does, would let the base class follow it
+     * with CONNECT_FAILED while STARTING, and NetworkManager keeps the last. */
+    self->failing = TRUE;
+    self->failure = reason;
+    nm_vpn_service_plugin_disconnect(NM_VPN_SERVICE_PLUGIN(self), NULL);
+}
+
+/* openfortivpn's messages for a login the gateway refused, or one that needs
+ * a second factor nobody is there to enter. Retrying won't get past either. */
+static gboolean
+is_login_rejection(const char *line)
+{
+    return strstr(line, "Could not authenticate") ||
+           strstr(line, "authentication failed") ||
+           strstr(line, "No OTP specified") ||
+           strstr(line, "No token specified");
 }
 
 /* Build the argv passed to openfortivpn. Password is delivered separately
@@ -178,12 +218,16 @@ parse_interface_up(NMOpenfortivpnPlugin *self, const char *line)
     self->tundev = g_strndup(p, end - p);
 }
 
-/* Build and emit the IP4Config NetworkManager expects when the tunnel comes
+/* Build and emit the config NetworkManager expects when the tunnel comes
  * up. All IPv4 addresses must be packed as uint32 in network byte order —
  * passing them as strings (as the earlier skeleton did) made NM silently
- * drop them and then time out with "no VPN gateway address received". */
+ * drop them and then time out with "no VPN gateway address received".
+ *
+ * The interface and gateway go in a separate Config, not just the IP4Config:
+ * once NetworkManager has seen one IP4Config it reads later ones as IPv4
+ * only, so after a reconnect it would keep configuring the old interface. */
 static void
-publish_ip4_config(NMOpenfortivpnPlugin *self)
+publish_config(NMOpenfortivpnPlugin *self)
 {
     GVariantBuilder b;
     struct in_addr in;
@@ -193,8 +237,10 @@ publish_ip4_config(NMOpenfortivpnPlugin *self)
     if (!self->tundev)
         g_warning("openfortivpn: tunnel device wasn't parsed; assuming ppp0");
     g_variant_builder_add(&b, "{sv}",
-                          NM_VPN_PLUGIN_IP4_CONFIG_TUNDEV,
+                          NM_VPN_PLUGIN_CONFIG_TUNDEV,
                           g_variant_new_string(self->tundev ? self->tundev : "ppp0"));
+    g_variant_builder_add(&b, "{sv}",
+                          NM_VPN_PLUGIN_CONFIG_HAS_IP4, g_variant_new_boolean(TRUE));
 
     /* Resolve the VPN endpoint FQDN to an IPv4 — NM uses this to install a
      * host route to the gateway through the original (non-VPN) interface so
@@ -205,13 +251,18 @@ publish_ip4_config(NMOpenfortivpnPlugin *self)
         if (getaddrinfo(self->gateway, NULL, &hints, &res) == 0 && res) {
             guint32 ext = ((struct sockaddr_in *) res->ai_addr)->sin_addr.s_addr;
             g_variant_builder_add(&b, "{sv}",
-                                  NM_VPN_PLUGIN_IP4_CONFIG_EXT_GATEWAY,
+                                  NM_VPN_PLUGIN_CONFIG_EXT_GATEWAY,
                                   g_variant_new_uint32(ext));
             freeaddrinfo(res);
         } else {
             g_warning("openfortivpn: could not resolve gateway '%s'", self->gateway);
         }
     }
+
+    nm_vpn_service_plugin_set_config(NM_VPN_SERVICE_PLUGIN(self),
+                                     g_variant_builder_end(&b));
+
+    g_variant_builder_init(&b, G_VARIANT_TYPE_VARDICT);
 
     if (self->local_addr && inet_pton(AF_INET, self->local_addr, &in) == 1) {
         g_variant_builder_add(&b, "{sv}",
@@ -251,25 +302,58 @@ publish_ip4_config(NMOpenfortivpnPlugin *self)
                                         g_variant_builder_end(&b));
 }
 
+/* --- tunnel state -------------------------------------------------------- */
+
+static void
+on_tunnel_up(NMOpenfortivpnPlugin *self)
+{
+    if (self->established)
+        g_message("openfortivpn: tunnel restored");
+    self->tunnel_up = TRUE;
+    self->established = TRUE;
+    self->up_since = g_get_monotonic_time();
+    publish_config(self);
+}
+
+/* The tunnel went down without anyone asking. NetworkManager reads STARTED
+ * going back to STARTING as the VPN reconnecting, and reports it as
+ * activating until the next config. Only report it once the interface is
+ * gone: NetworkManager takes the next change to the interface's settings,
+ * such as the one its removal causes, as the reconnect being done. */
+static void
+on_tunnel_lost(NMOpenfortivpnPlugin *self)
+{
+    if (!self->tunnel_up)
+        return;
+
+    self->tunnel_up = FALSE;
+    if (g_get_monotonic_time() - self->up_since >= RECONNECT_DELAY_MAX_SEC * G_USEC_PER_SEC)
+        self->reconnect_delay = RECONNECT_DELAY_MIN_SEC;
+    g_message("openfortivpn: tunnel lost; reconnecting");
+    g_object_set(self, NM_VPN_SERVICE_PLUGIN_STATE, NM_VPN_SERVICE_STATE_STARTING, NULL);
+}
+
 /* --- child stdout reader ------------------------------------------------- */
 
-static void child_read_line_async(NMOpenfortivpnPlugin *self);
+static void child_read_line_async(NMOpenfortivpnPlugin *self, GDataInputStream *stream);
 
 static void
 on_child_line(GObject *src, GAsyncResult *res, gpointer user_data)
 {
     NMOpenfortivpnPlugin *self = NM_OPENFORTIVPN_PLUGIN(user_data);
+    GDataInputStream *stream = G_DATA_INPUT_STREAM(src);
     g_autoptr(GError) error = NULL;
     gsize len = 0;
     g_autofree char *line =
-        g_data_input_stream_read_line_finish_utf8(G_DATA_INPUT_STREAM(src), res, &len, &error);
+        g_data_input_stream_read_line_finish_utf8(stream, res, &len, &error);
 
     if (g_cancellable_is_cancelled(self->cancellable))
         return;
 
     if (error) {
-        openfortivpn_fail(self, NM_VPN_PLUGIN_FAILURE_CONNECT_FAILED,
-                      "openfortivpn read error: %s", error->message);
+        if (stream == self->child_stdout && !self->stopping)
+            openfortivpn_fail(self, NM_VPN_PLUGIN_FAILURE_CONNECT_FAILED,
+                              "openfortivpn read error: %s", error->message);
         return;
     }
     if (!line) {
@@ -284,9 +368,10 @@ on_child_line(GObject *src, GAsyncResult *res, gpointer user_data)
     fflush(stderr);
 
     /* Keep draining while stopping so openfortivpn's teardown never blocks on
-     * a full pipe, but its errors no longer mean the connection failed. */
-    if (self->stopping) {
-        child_read_line_async(self);
+     * a full pipe, but its errors no longer mean the connection failed. The
+     * same goes for whatever an earlier openfortivpn left in its pipe. */
+    if (self->stopping || stream != self->child_stdout) {
+        child_read_line_async(self, stream);
         return;
     }
 
@@ -298,19 +383,28 @@ on_child_line(GObject *src, GAsyncResult *res, gpointer user_data)
     } else if (strstr(line, "Interface ") && strstr(line, " is UP")) {
         parse_interface_up(self, line);
     } else if (strstr(line, "Tunnel is up and running")) {
-        publish_ip4_config(self);
-    } else if (strstr(line, "ERROR:") || strstr(line, "authentication failed")) {
-        openfortivpn_fail(self, NM_VPN_PLUGIN_FAILURE_LOGIN_FAILED, "%s", line);
-        return;
+        on_tunnel_up(self);
+    } else if (strstr(line, "Terminated pppd")) {
+        /* pppd is gone and its interface with it; openfortivpn logs out and
+         * exits next. */
+        on_tunnel_lost(self);
+    } else if (!self->tunnel_up && is_login_rejection(line)) {
+        /* Once the tunnel is up, the same message is just how it ended. */
+        openfortivpn_fail(self, NM_VPN_PLUGIN_FAILURE_LOGIN_FAILED,
+                          "openfortivpn: gateway rejected the login: %s", line);
+    } else if (!self->established && strstr(line, "ERROR:")) {
+        /* The first connect reports errors at once. After that, a failed
+         * attempt just exits and the next one follows. */
+        openfortivpn_fail(self, NM_VPN_PLUGIN_FAILURE_CONNECT_FAILED, "%s", line);
     }
 
-    child_read_line_async(self);
+    child_read_line_async(self, stream);
 }
 
 static void
-child_read_line_async(NMOpenfortivpnPlugin *self)
+child_read_line_async(NMOpenfortivpnPlugin *self, GDataInputStream *stream)
 {
-    g_data_input_stream_read_line_async(self->child_stdout,
+    g_data_input_stream_read_line_async(stream,
                                         G_PRIORITY_DEFAULT,
                                         self->cancellable,
                                         on_child_line,
@@ -318,6 +412,9 @@ child_read_line_async(NMOpenfortivpnPlugin *self)
 }
 
 /* --- child lifecycle ----------------------------------------------------- */
+
+static gboolean spawn_openfortivpn(NMOpenfortivpnPlugin *self, GError **error);
+static void schedule_reconnect(NMOpenfortivpnPlugin *self);
 
 static void
 on_child_exited(GObject *src, GAsyncResult *res, gpointer user_data)
@@ -329,16 +426,47 @@ on_child_exited(GObject *src, GAsyncResult *res, gpointer user_data)
     g_clear_handle_id(&self->kill_timeout_id, g_source_remove);
     g_clear_object(&self->child);
 
-    if (!self->stopping) {
-        /* openfortivpn went away on its own: the connection is over. */
+    if (self->stopping) {
+        /* Asked to exit, or it's already been reported. */
+    } else if (self->established) {
+        /* The session was up, so it's still wanted: get the tunnel back. */
         if (!ok)
-            openfortivpn_fail(self, NM_VPN_PLUGIN_FAILURE_CONNECT_FAILED,
-                              "openfortivpn exited: %s", error->message);
-        else
-            nm_vpn_service_plugin_disconnect(NM_VPN_SERVICE_PLUGIN(self), NULL);
+            g_message("openfortivpn exited: %s", error->message);
+        on_tunnel_lost(self);
+        schedule_reconnect(self);
+    } else if (!ok) {
+        /* The first connect didn't make it: let NetworkManager report it. */
+        openfortivpn_fail(self, NM_VPN_PLUGIN_FAILURE_CONNECT_FAILED,
+                          "openfortivpn exited: %s", error->message);
+    } else {
+        nm_vpn_service_plugin_disconnect(NM_VPN_SERVICE_PLUGIN(self), NULL);
     }
 
     g_signal_emit(self, signals[SIGNAL_CHILD_EXITED], 0);
+}
+
+static gboolean
+on_reconnect(gpointer user_data)
+{
+    NMOpenfortivpnPlugin *self = NM_OPENFORTIVPN_PLUGIN(user_data);
+    g_autoptr(GError) error = NULL;
+
+    self->reconnect_id = 0;
+    if (!spawn_openfortivpn(self, &error)) {
+        g_warning("openfortivpn: could not restart: %s", error->message);
+        schedule_reconnect(self);
+    }
+    return G_SOURCE_REMOVE;
+}
+
+static void
+schedule_reconnect(NMOpenfortivpnPlugin *self)
+{
+    guint delay = self->reconnect_delay;
+
+    g_message("openfortivpn: reconnecting in %u s", delay);
+    self->reconnect_delay = MIN(delay * 2, RECONNECT_DELAY_MAX_SEC);
+    self->reconnect_id = g_timeout_add_seconds(delay, on_reconnect, self);
 }
 
 static gboolean
@@ -355,15 +483,31 @@ on_kill_timeout(gpointer user_data)
     return G_SOURCE_REMOVE;
 }
 
-/* Ask openfortivpn to log out and exit. on_child_exited() reports when it
- * has; if it's still there after CHILD_KILL_TIMEOUT_SEC it is killed. */
+static void
+forget_session(NMOpenfortivpnPlugin *self)
+{
+    if (self->password) {
+        explicit_bzero(self->password, strlen(self->password));
+        g_clear_pointer(&self->password, g_free);
+    }
+    g_clear_pointer(&self->argv, g_strfreev);
+}
+
+/* End the session: no more reconnects, and ask openfortivpn to log out and
+ * exit. on_child_exited() reports when it has; if it's still there after
+ * CHILD_KILL_TIMEOUT_SEC it is killed. */
 static void
 stop_child(NMOpenfortivpnPlugin *self)
 {
-    if (!self->child || self->stopping)
+    if (self->stopping)
         return;
 
     self->stopping = TRUE;
+    g_clear_handle_id(&self->reconnect_id, g_source_remove);
+    forget_session(self);
+    if (!self->child)
+        return;
+
     /* SIGINT lets openfortivpn unwind cleanly (logout, route removal). */
     g_subprocess_send_signal(self->child, SIGINT);
     self->kill_timeout_id = g_timeout_add_seconds(CHILD_KILL_TIMEOUT_SEC,
@@ -376,16 +520,21 @@ nm_openfortivpn_plugin_has_child(NMOpenfortivpnPlugin *self)
     return self->child != NULL;
 }
 
+/* Start openfortivpn for the current session; on reconnects too. */
 static gboolean
-spawn_openfortivpn(NMOpenfortivpnPlugin *self,
-                   char **argv,
-                   const char *password,
-                   GError **error)
+spawn_openfortivpn(NMOpenfortivpnPlugin *self, GError **error)
 {
+    char **argv = self->argv;
     g_autoptr(GSubprocessLauncher) l =
         g_subprocess_launcher_new(G_SUBPROCESS_FLAGS_STDIN_PIPE |
                                   G_SUBPROCESS_FLAGS_STDOUT_PIPE |
                                   G_SUBPROCESS_FLAGS_STDERR_MERGE);
+
+    /* Whatever the last openfortivpn reported is gone with its tunnel. */
+    self->tunnel_up = FALSE;
+    g_clear_pointer(&self->tundev,     g_free);
+    g_clear_pointer(&self->local_addr, g_free);
+    g_clear_pointer(&self->dns_list,   g_strfreev);
 
     /* Diagnostic: log the exact argv before spawning. fprintf(stderr) instead
      * of g_message because we're trying to determine whether glib's structured
@@ -408,16 +557,18 @@ spawn_openfortivpn(NMOpenfortivpnPlugin *self,
 
     /* Feed the password on stdin, then close it. */
     GOutputStream *child_stdin = g_subprocess_get_stdin_pipe(self->child);
-    if (child_stdin && password) {
-        g_autofree char *pw_line = g_strdup_printf("%s\n", password);
+    if (child_stdin && self->password) {
+        g_autofree char *pw_line = g_strdup_printf("%s\n", self->password);
         g_output_stream_write_all(child_stdin, pw_line, strlen(pw_line),
                                   NULL, NULL, NULL);
+        explicit_bzero(pw_line, strlen(pw_line));
         g_output_stream_close(child_stdin, NULL, NULL);
     }
 
     GInputStream *child_out = g_subprocess_get_stdout_pipe(self->child);
+    g_clear_object(&self->child_stdout);
     self->child_stdout = g_data_input_stream_new(child_out);
-    child_read_line_async(self);
+    child_read_line_async(self, self->child_stdout);
 
     /* Not cancellable: the exit is what tells us the tunnel is gone. */
     g_subprocess_wait_check_async(self->child,
@@ -459,8 +610,18 @@ openfortivpn_connect(NMVpnServicePlugin *plugin, NMConnection *connection, GErro
     g_clear_object(&self->cancellable);
     self->cancellable = g_cancellable_new();
 
-    if (!spawn_openfortivpn(self, argv, password, error))
+    forget_session(self);
+    self->argv = g_steal_pointer(&argv);
+    self->password = g_strdup(password);
+    self->stopping = FALSE;
+    self->failing = FALSE;
+    self->established = FALSE;
+    self->reconnect_delay = RECONNECT_DELAY_MIN_SEC;
+
+    if (!spawn_openfortivpn(self, error)) {
+        forget_session(self);
         return FALSE;
+    }
 
     /* Returning TRUE puts the plugin into STARTING; the base class moves it
      * to STARTED when we publish an IP4Config. */
@@ -485,7 +646,16 @@ openfortivpn_need_secrets(G_GNUC_UNUSED NMVpnServicePlugin *plugin,
 static gboolean
 openfortivpn_disconnect(NMVpnServicePlugin *plugin, G_GNUC_UNUSED GError **error)
 {
-    stop_child(NM_OPENFORTIVPN_PLUGIN(plugin));
+    NMOpenfortivpnPlugin *self = NM_OPENFORTIVPN_PLUGIN(plugin);
+
+    /* Runs after the base class has reported any failure of its own, so this
+     * reason is the one NetworkManager shows. The base class's disconnect
+     * does nothing while STOPPING. */
+    if (self->failing) {
+        self->failing = FALSE;
+        nm_vpn_service_plugin_failure(plugin, self->failure);
+    }
+    stop_child(self);
     return TRUE;
 }
 
@@ -507,6 +677,8 @@ nm_openfortivpn_plugin_dispose(GObject *obj)
         g_subprocess_force_exit(self->child);
 
     g_clear_handle_id(&self->kill_timeout_id, g_source_remove);
+    g_clear_handle_id(&self->reconnect_id, g_source_remove);
+    forget_session(self);
     g_clear_object(&self->child_stdout);
     g_clear_object(&self->child);
     g_clear_object(&self->cancellable);
