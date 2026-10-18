@@ -7,7 +7,8 @@
  *   - on Connect, spawn openfortivpn with config built from NMSettingVpn data
  *   - on tunnel-up (parsed from openfortivpn stdout), publish a stub IP4Config
  *   - on losing an established tunnel, report STARTING and restart
- *     openfortivpn with the session's password until the tunnel is back
+ *     openfortivpn with the session's password until the tunnel is back,
+ *     or until RECONNECT_ATTEMPTS_MAX attempts in a row have failed
  *   - on disconnect, login rejection or a failed first connect, transition to
  *     STOPPED; the process stays until openfortivpn has exited, killing it if
  *     SIGINT isn't enough
@@ -54,6 +55,15 @@
 #endif
 #define RECONNECT_DELAY_MAX_SEC 60
 
+/* Give up once this many attempts in a row haven't brought the tunnel back,
+ * about 7 minutes with the delays above. While the service reports the VPN
+ * as reconnecting, NetworkManager keeps the DNS servers of the network it
+ * runs over switched off, so a gateway that stays out of reach would leave
+ * the machine without DNS until someone took the VPN down. */
+#ifndef RECONNECT_ATTEMPTS_MAX
+#define RECONNECT_ATTEMPTS_MAX 10
+#endif
+
 /* --- plugin object ------------------------------------------------------- */
 
 struct _NMOpenfortivpnPlugin {
@@ -75,8 +85,11 @@ struct _NMOpenfortivpnPlugin {
     gboolean      established;      /* the tunnel came up once this session */
     guint         reconnect_id;     /* pending restart of openfortivpn */
     guint         reconnect_delay;  /* seconds before the next restart */
+    guint         reconnect_attempts; /* restarts since the tunnel was last up */
     gint64        up_since;         /* monotonic time the tunnel came up */
     char         *gateway;          /* configured FQDN, e.g. "vpn.moreh.dev" */
+    char         *port;             /* configured port, or NULL */
+    guint32       gateway_addr;     /* gateway's last resolved IPv4, network order; 0 if none */
     char         *tundev;           /* from "Interface pppN is UP", e.g. "ppp1" */
 
     /* Parsed from openfortivpn's "Got addresses: [..], ns [..]" line. Used to
@@ -218,6 +231,28 @@ parse_interface_up(NMOpenfortivpnPlugin *self, const char *line)
     self->tundev = g_strndup(p, end - p);
 }
 
+/* Look the gateway up and remember its address. While the tunnel is down
+ * the lookup can fail: the VPN's DNS servers are gone with it, and
+ * NetworkManager doesn't switch the other network's back on while the VPN
+ * is reconnecting. FALSE then, and gateway_addr keeps the last address. */
+static gboolean
+resolve_gateway(NMOpenfortivpnPlugin *self)
+{
+    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
+    struct addrinfo *res = NULL;
+
+    if (!self->gateway || !*self->gateway)
+        return FALSE;
+    if (getaddrinfo(self->gateway, NULL, &hints, &res) != 0 || !res) {
+        g_warning("openfortivpn: could not resolve gateway '%s'%s", self->gateway,
+                  self->gateway_addr ? "; using its last address" : "");
+        return FALSE;
+    }
+    self->gateway_addr = ((struct sockaddr_in *) res->ai_addr)->sin_addr.s_addr;
+    freeaddrinfo(res);
+    return TRUE;
+}
+
 /* Build and emit the config NetworkManager expects when the tunnel comes
  * up. All IPv4 addresses must be packed as uint32 in network byte order —
  * passing them as strings (as the earlier skeleton did) made NM silently
@@ -245,19 +280,11 @@ publish_config(NMOpenfortivpnPlugin *self)
     /* Resolve the VPN endpoint FQDN to an IPv4 — NM uses this to install a
      * host route to the gateway through the original (non-VPN) interface so
      * the encrypted traffic doesn't loop back into the tunnel. */
-    if (self->gateway && *self->gateway) {
-        struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
-        struct addrinfo *res = NULL;
-        if (getaddrinfo(self->gateway, NULL, &hints, &res) == 0 && res) {
-            guint32 ext = ((struct sockaddr_in *) res->ai_addr)->sin_addr.s_addr;
-            g_variant_builder_add(&b, "{sv}",
-                                  NM_VPN_PLUGIN_CONFIG_EXT_GATEWAY,
-                                  g_variant_new_uint32(ext));
-            freeaddrinfo(res);
-        } else {
-            g_warning("openfortivpn: could not resolve gateway '%s'", self->gateway);
-        }
-    }
+    resolve_gateway(self);
+    if (self->gateway_addr)
+        g_variant_builder_add(&b, "{sv}",
+                              NM_VPN_PLUGIN_CONFIG_EXT_GATEWAY,
+                              g_variant_new_uint32(self->gateway_addr));
 
     nm_vpn_service_plugin_set_config(NM_VPN_SERVICE_PLUGIN(self),
                                      g_variant_builder_end(&b));
@@ -311,6 +338,7 @@ on_tunnel_up(NMOpenfortivpnPlugin *self)
         g_message("openfortivpn: tunnel restored");
     self->tunnel_up = TRUE;
     self->established = TRUE;
+    self->reconnect_attempts = 0;
     self->up_since = g_get_monotonic_time();
     publish_config(self);
 }
@@ -413,7 +441,7 @@ child_read_line_async(NMOpenfortivpnPlugin *self, GDataInputStream *stream)
 
 /* --- child lifecycle ----------------------------------------------------- */
 
-static gboolean spawn_openfortivpn(NMOpenfortivpnPlugin *self, GError **error);
+static gboolean spawn_openfortivpn(NMOpenfortivpnPlugin *self, char **argv, GError **error);
 static void schedule_reconnect(NMOpenfortivpnPlugin *self);
 
 static void
@@ -445,14 +473,46 @@ on_child_exited(GObject *src, GAsyncResult *res, gpointer user_data)
     g_signal_emit(self, signals[SIGNAL_CHILD_EXITED], 0);
 }
 
+/* openfortivpn looks the gateway up itself, so while the name doesn't
+ * resolve (see resolve_gateway()) it can't get the tunnel back, and the
+ * VPN's DNS servers don't return until it does. Point it at the address the
+ * name last resolved to, still naming the gateway in the TLS handshake.
+ * openfortivpn checks the certificate against the address then, so this
+ * relies on trusted-cert unless the certificate lists that address.
+ * Returns NULL when the session's argv will do. */
+static char **
+build_reconnect_argv(NMOpenfortivpnPlugin *self)
+{
+    char addr[INET_ADDRSTRLEN];
+
+    if (resolve_gateway(self) || !self->gateway_addr)
+        return NULL;
+    inet_ntop(AF_INET, &self->gateway_addr, addr, sizeof(addr));
+
+    g_autoptr(GPtrArray) argv = g_ptr_array_new_with_free_func(g_free);
+    for (gsize i = 0; self->argv[i]; i++)
+        g_ptr_array_add(argv, g_strdup(self->argv[i]));
+
+    /* argv[1] is the gateway, where build_openfortivpn_argv() puts it. */
+    g_free(argv->pdata[1]);
+    argv->pdata[1] = self->port ? g_strdup_printf("%s:%s", addr, self->port)
+                                : g_strdup(addr);
+    g_ptr_array_add(argv, g_strdup_printf("--sni=%s", self->gateway));
+
+    g_ptr_array_add(argv, NULL);
+    return (char **) g_ptr_array_steal(argv, NULL);
+}
+
 static gboolean
 on_reconnect(gpointer user_data)
 {
     NMOpenfortivpnPlugin *self = NM_OPENFORTIVPN_PLUGIN(user_data);
     g_autoptr(GError) error = NULL;
+    g_auto(GStrv) argv = NULL;
 
     self->reconnect_id = 0;
-    if (!spawn_openfortivpn(self, &error)) {
+    argv = build_reconnect_argv(self);
+    if (!spawn_openfortivpn(self, argv ? argv : self->argv, &error)) {
         g_warning("openfortivpn: could not restart: %s", error->message);
         schedule_reconnect(self);
     }
@@ -464,6 +524,13 @@ schedule_reconnect(NMOpenfortivpnPlugin *self)
 {
     guint delay = self->reconnect_delay;
 
+    if (self->reconnect_attempts >= RECONNECT_ATTEMPTS_MAX) {
+        openfortivpn_fail(self, NM_VPN_PLUGIN_FAILURE_CONNECT_FAILED,
+                          "openfortivpn: tunnel not restored after %u attempts; giving up",
+                          self->reconnect_attempts);
+        return;
+    }
+    self->reconnect_attempts++;
     g_message("openfortivpn: reconnecting in %u s", delay);
     self->reconnect_delay = MIN(delay * 2, RECONNECT_DELAY_MAX_SEC);
     self->reconnect_id = g_timeout_add_seconds(delay, on_reconnect, self);
@@ -522,9 +589,8 @@ nm_openfortivpn_plugin_has_child(NMOpenfortivpnPlugin *self)
 
 /* Start openfortivpn for the current session; on reconnects too. */
 static gboolean
-spawn_openfortivpn(NMOpenfortivpnPlugin *self, GError **error)
+spawn_openfortivpn(NMOpenfortivpnPlugin *self, char **argv, GError **error)
 {
-    char **argv = self->argv;
     g_autoptr(GSubprocessLauncher) l =
         g_subprocess_launcher_new(G_SUBPROCESS_FLAGS_STDIN_PIPE |
                                   G_SUBPROCESS_FLAGS_STDOUT_PIPE |
@@ -592,8 +658,13 @@ openfortivpn_connect(NMVpnServicePlugin *plugin, NMConnection *connection, GErro
         return FALSE;
     }
 
+    const char *port = nm_setting_vpn_get_data_item(s_vpn, NM_OPENFORTIVPN_KEY_PORT);
+
     g_clear_pointer(&self->gateway, g_free);
+    g_clear_pointer(&self->port, g_free);
     self->gateway = g_strdup(nm_setting_vpn_get_data_item(s_vpn, NM_OPENFORTIVPN_KEY_GATEWAY));
+    self->port = port && *port ? g_strdup(port) : NULL;
+    self->gateway_addr = 0;
 
     g_auto(GStrv) argv = build_openfortivpn_argv(s_vpn, error);
     if (!argv)
@@ -617,8 +688,9 @@ openfortivpn_connect(NMVpnServicePlugin *plugin, NMConnection *connection, GErro
     self->failing = FALSE;
     self->established = FALSE;
     self->reconnect_delay = RECONNECT_DELAY_MIN_SEC;
+    self->reconnect_attempts = 0;
 
-    if (!spawn_openfortivpn(self, error)) {
+    if (!spawn_openfortivpn(self, self->argv, error)) {
         forget_session(self);
         return FALSE;
     }
@@ -683,6 +755,7 @@ nm_openfortivpn_plugin_dispose(GObject *obj)
     g_clear_object(&self->child);
     g_clear_object(&self->cancellable);
     g_clear_pointer(&self->gateway,    g_free);
+    g_clear_pointer(&self->port,       g_free);
     g_clear_pointer(&self->tundev,     g_free);
     g_clear_pointer(&self->local_addr, g_free);
     g_clear_pointer(&self->dns_list,   g_strfreev);

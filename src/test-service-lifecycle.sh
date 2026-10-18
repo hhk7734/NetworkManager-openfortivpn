@@ -86,8 +86,13 @@ plugin_call() {
     --method "org.freedesktop.NetworkManager.VPN.Plugin.$1" "${@:2}" >/dev/null
 }
 
-# start_connected [ENV=VALUE...] -- start the service and connect it
+# start_connected [ENV=VALUE...] -- start the service and connect it, to
+# $gateway (default 192.0.2.1). With $hosts set, the service sees that file
+# as /etc/hosts.
 start_connected() {
+  local wrap=()
+  [ -n "${hosts:-}" ] &&
+    wrap=(unshare --mount sh -c 'mount --bind "$0" /etc/hosts && exec "$@"' "$hosts")
   # Remember every earlier service and fake so cleanup can kill them all.
   echo $(fake_pids) $svc_pid >> "$tmpdir/all-pids"
   : > "$tmpdir/fake.log"
@@ -97,7 +102,7 @@ start_connected() {
   gdbus monitor --system --dest "$bus" > "$tmpdir/monitor.log" 2>&1 &
   monitor_pid=$!
   sudo -n env FAKE_LOG="$tmpdir/fake.log" FAKE_MODE_FILE="$tmpdir/mode" "$@" \
-    "$service" --bus-name "$bus" \
+    "${wrap[@]}" "$service" --bus-name "$bus" \
     > "$tmpdir/service.log" 2>&1 &
   for _ in $(seq 50); do
     svc_pid=$(pgrep -f "^$service --bus-name $bus\$")
@@ -107,7 +112,7 @@ start_connected() {
   done
   plugin_call Connect "{'connection': {'id': <'test'>, 'uuid': <'00000000-0000-0000-0000-000000000001'>, 'type': <'vpn'>},
     'vpn': {'service-type': <'org.freedesktop.NetworkManager.openfortivpn'>,
-            'data': <{'gateway': '192.0.2.1', 'user': 'test'}>,
+            'data': <{'gateway': '${gateway:-192.0.2.1}', 'user': 'test'}>,
             'secrets': <{'password': 'secret'}>}}"
   for _ in $(seq 50); do
     grep -q 'Tunnel is up\|rejected the login' "$tmpdir/service.log" && break
@@ -269,5 +274,60 @@ wait_gone 5 "$svc_pid" && pass "rejected first login stops the service" \
 stop_monitor
 [ "$(last_failure)" = "Failure 0" ] && pass "rejected first login is reported as login failed" \
                                     || fail "rejected first login reported as $(last_failure)"
+
+# 10. While the gateway's name doesn't resolve, which NetworkManager causes
+#     by keeping DNS off until the VPN is back, reconnect to the address it
+#     last resolved to and name the gateway in the TLS handshake.
+name=vpn.nm-openfortivpn.test
+echo "192.0.2.1 $name" > "$tmpdir/hosts"
+hosts=$tmpdir/hosts gateway=$name start_connected
+: > "$tmpdir/hosts"
+drop_tunnel
+if wait_until 10 tunnels_reach 2; then
+  pass "tunnel restored while the gateway's name doesn't resolve"
+else
+  fail "tunnel not restored without DNS; openfortivpn started $(starts) times"
+fi
+args=$(sed -n 's/^args //p' "$tmpdir/fake.log")
+first=$(head -n1 <<< "$args" | cut -d' ' -f1)
+retry=$(tail -n1 <<< "$args")
+[ "$first" = "$name" ] && pass "first connect uses the gateway's name" \
+                       || fail "first connect went to $first"
+if [ "${retry%% *}" = 192.0.2.1 ] && [[ " $retry " = *" --sni=$name "* ]]; then
+  pass "reconnect uses the last address with the name as SNI"
+else
+  fail "reconnect args: $retry"
+fi
+sleep 0.3
+stop_monitor
+# Both Configs carry 192.0.2.1, as a uint32 in network byte order read on a
+# little-endian host. libnm copies it into the Ip4Configs too, so skip those.
+configs=$(grep 'VPN\.Plugin\.Config ' "$tmpdir/monitor.log")
+if [ "$(grep -c . <<< "$configs")" = 2 ] &&
+   [ "$(grep -c "'gateway': <uint32 16908480>" <<< "$configs")" = 2 ]; then
+  pass "reconnected config keeps the gateway address"
+else
+  fail "gateway address in configs: $(grep -o "'gateway': <[^>]*>" <<< "$configs" | paste -sd' ')"
+fi
+plugin_call Disconnect
+wait_gone 3 "$svc_pid" || fail "service still running after disconnect"
+
+# 11. A gateway that stays out of reach is given up on after
+#     RECONNECT_ATTEMPTS_MAX (5 in the test build) attempts, so NetworkManager
+#     takes the VPN down and switches the other network's DNS back on.
+start_connected
+set_mode unreachable
+drop_tunnel
+if wait_gone 45 "$svc_pid"; then
+  pass "service gives up on a gateway that stays out of reach"
+else
+  fail "service still reconnecting; openfortivpn started $(starts) times"
+fi
+[ "$(starts)" = 6 ] && pass "gave up after 5 attempts" \
+                    || fail "openfortivpn started $(starts) times, not 6"
+stop_monitor
+[ "$(last_failure)" = "Failure 1" ] && pass "giving up is reported as connect failed" \
+                                    || fail "giving up reported as $(last_failure)"
+[ "$(events | tail -n1)" = "StateChanged 6" ] || fail "last signal is $(events | tail -n1), not stopped"
 
 exit $(( failures > 0 ))
