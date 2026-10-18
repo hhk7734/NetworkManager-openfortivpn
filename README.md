@@ -135,6 +135,14 @@ the first attempt and doubles the wait after each one, up to 60 s, until the
 tunnel is back. The wait starts over at 5 s once a tunnel has stayed up for a
 minute.
 
+If the gateway's name doesn't resolve during an attempt, the service connects
+to the address it last resolved to and still sends the name as the TLS server
+name (SNI). Expect this whenever the VPN sets DNS servers: they replace the
+other network's, and NetworkManager doesn't switch those back on while the
+VPN is reconnecting. openfortivpn checks the
+gateway's certificate against that address, so this works when `trusted-cert`
+is set (or the certificate lists the address).
+
 While it reconnects, NetworkManager shows the VPN as activating
 (`nmcli connection show --active`), and the old interface's address, routes
 and DNS servers go away with it. Once the tunnel is back, NetworkManager
@@ -147,6 +155,10 @@ This only works while that VPN session is still running:
 - If the gateway rejects the login on any attempt, the service stops trying
   and the VPN fails with "Invalid secrets" (`login-failed` in the
   NetworkManager log).
+- After 10 attempts in a row that don't bring the tunnel back, about 7
+  minutes, the service gives up and the VPN fails (`connect-failed` in the
+  NetworkManager log). NetworkManager then takes the VPN down and switches the
+  other network's DNS servers back on.
 - Once the session has ended, nothing brings it back. That includes the VPN
   service or NetworkManager exiting or restarting, or the network the VPN runs
   over going down. Connect again, as you would the first time.

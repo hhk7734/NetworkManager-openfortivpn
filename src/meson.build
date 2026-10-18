@@ -17,7 +17,8 @@ test_service = executable(
   c_args:              ['-DG_LOG_DOMAIN="nm-openfortivpn"',
                         '-DOPENFORTIVPN_TEST_PATH="@0@"'.format(
                           meson.current_source_dir() / 'test-fake-openfortivpn'),
-                        '-DRECONNECT_DELAY_MIN_SEC=1'],
+                        '-DRECONNECT_DELAY_MIN_SEC=1',
+                        '-DRECONNECT_ATTEMPTS_MAX=5'],
 )
 
 test('service-lifecycle',
@@ -25,4 +26,4 @@ test('service-lifecycle',
      args:       [test_service.full_path()],
      depends:    [test_service],
      is_parallel: false,
-     timeout:    120)
+     timeout:    240)
