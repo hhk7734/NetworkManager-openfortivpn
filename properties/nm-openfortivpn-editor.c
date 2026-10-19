@@ -25,6 +25,8 @@ struct _NMOpenfortivpnEditor {
     GtkSwitch   *save_password_switch;
     GtkEditable *trusted_cert_entry;
     GtkSwitch   *insecure_switch;
+    GtkSwitch   *reconnect_switch;  /* vpn.persistent */
+    GtkSpinButton *timeout_spin;    /* vpn.timeout in seconds; 0 = default */
 
     char        *password;        /* secret loaded with the connection, if any */
 };
@@ -71,6 +73,9 @@ load_from_connection(NMOpenfortivpnEditor *self, NMConnection *connection)
                           !(flags & NM_SETTING_SECRET_FLAG_NOT_SAVED));
 
     self->password = g_strdup(nm_setting_vpn_get_secret(s_vpn, NM_OPENFORTIVPN_KEY_PASSWORD));
+
+    gtk_switch_set_active(self->reconnect_switch, nm_setting_vpn_get_persistent(s_vpn));
+    gtk_spin_button_set_value(self->timeout_spin, nm_setting_vpn_get_timeout(s_vpn));
 }
 
 static void
@@ -102,7 +107,13 @@ update_connection(NMVpnEditor *iface, NMConnection *connection, G_GNUC_UNUSED GE
     NMOpenfortivpnEditor *self = NM_OPENFORTIVPN_EDITOR(iface);
 
     g_autoptr(NMSettingVpn) s_vpn = NM_SETTING_VPN(nm_setting_vpn_new());
-    g_object_set(s_vpn, NM_SETTING_VPN_SERVICE_TYPE, NM_DBUS_SERVICE_OPENFORTIVPN, NULL);
+    /* A new setting replaces the old one whole, so its own properties are
+     * written here too, or a save would reset them. */
+    g_object_set(s_vpn,
+                 NM_SETTING_VPN_SERVICE_TYPE, NM_DBUS_SERVICE_OPENFORTIVPN,
+                 NM_SETTING_VPN_PERSISTENT,   gtk_switch_get_active(self->reconnect_switch),
+                 NM_SETTING_VPN_TIMEOUT,      (guint) gtk_spin_button_get_value_as_int(self->timeout_spin),
+                 NULL);
 
 #define SET_IF(key, str) \
     do { const char *_v = (str); if (_v && *_v) nm_setting_vpn_add_data_item(s_vpn, (key), _v); } while (0)
@@ -158,6 +169,8 @@ nm_openfortivpn_editor_new(NMConnection *connection, GError **error)
     self->save_password_switch = GTK_SWITCH  (gtk_builder_get_object(self->builder, "save-password-switch"));
     self->trusted_cert_entry   = GTK_EDITABLE(gtk_builder_get_object(self->builder, "trusted-cert-entry"));
     self->insecure_switch      = GTK_SWITCH  (gtk_builder_get_object(self->builder, "insecure-switch"));
+    self->reconnect_switch     = GTK_SWITCH  (gtk_builder_get_object(self->builder, "reconnect-switch"));
+    self->timeout_spin         = GTK_SPIN_BUTTON(gtk_builder_get_object(self->builder, "timeout-spin"));
 
     if (!self->widget) {
         g_set_error_literal(error, NM_CONNECTION_ERROR,
@@ -179,6 +192,9 @@ nm_openfortivpn_editor_new(NMConnection *connection, GError **error)
     g_signal_connect(self->trusted_cert_entry,   "changed", G_CALLBACK(on_changed), self);
     g_signal_connect(self->insecure_switch,      "notify::active",
                      G_CALLBACK(on_notify_changed), self);
+    g_signal_connect(self->reconnect_switch,     "notify::active",
+                     G_CALLBACK(on_notify_changed), self);
+    g_signal_connect(self->timeout_spin,         "value-changed", G_CALLBACK(on_changed), self);
 
     return NM_VPN_EDITOR(self);
 }

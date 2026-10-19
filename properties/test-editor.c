@@ -84,6 +84,37 @@ find_active_switch(GtkWidget *widget)
     return NULL;
 }
 
+static GtkWidget *
+find_widget_of_type(GtkWidget *widget, GType type)
+{
+    if (G_TYPE_CHECK_INSTANCE_TYPE(widget, type))
+        return widget;
+
+    for (GtkWidget *child = gtk_widget_get_first_child(widget);
+         child;
+         child = gtk_widget_get_next_sibling(child)) {
+        GtkWidget *found = find_widget_of_type(child, type);
+        if (found)
+            return found;
+    }
+
+    return NULL;
+}
+
+static NMSettingVpn *
+update_into_new_connection(NMVpnEditor *editor, NMConnection **out)
+{
+    g_autoptr(GError) error = NULL;
+
+    *out = nm_simple_connection_new();
+    g_assert_true(nm_vpn_editor_update_connection(editor, *out, &error));
+    g_assert_no_error(error);
+
+    NMSettingVpn *s_vpn = nm_connection_get_setting_vpn(*out);
+    g_assert_nonnull(s_vpn);
+    return s_vpn;
+}
+
 static void
 on_editor_changed(G_GNUC_UNUSED NMVpnEditor *editor, gpointer user_data)
 {
@@ -236,6 +267,74 @@ test_not_saved_password_stays_not_saved(void)
     g_assert_null(nm_setting_vpn_get_secret(s_vpn, NM_OPENFORTIVPN_KEY_PASSWORD));
 }
 
+/* The editor replaces the VPN setting whole, so a save must keep these. */
+static void
+test_reconnect_settings_are_kept(void)
+{
+    if (!ensure_gtk())
+        return;
+
+    g_autoptr(GError) error = NULL;
+    g_autoptr(NMConnection) input =
+        new_connection_with_password_flags(NM_SETTING_SECRET_FLAG_AGENT_OWNED, NULL);
+    g_object_set(nm_connection_get_setting_vpn(input),
+                 NM_SETTING_VPN_PERSISTENT, TRUE,
+                 NM_SETTING_VPN_TIMEOUT,    600u,
+                 NULL);
+    g_autoptr(NMVpnEditor) editor = nm_openfortivpn_editor_new(input, &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(editor);
+
+    g_autoptr(NMConnection) output = NULL;
+    NMSettingVpn *s_vpn = update_into_new_connection(editor, &output);
+    g_assert_true(nm_setting_vpn_get_persistent(s_vpn));
+    g_assert_cmpuint(nm_setting_vpn_get_timeout(s_vpn), ==, 600);
+}
+
+static void
+test_reconnect_settings_default_off(void)
+{
+    if (!ensure_gtk())
+        return;
+
+    g_autoptr(GError) error = NULL;
+    g_autoptr(NMVpnEditor) editor = nm_openfortivpn_editor_new(NULL, &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(editor);
+
+    g_autoptr(NMConnection) output = NULL;
+    NMSettingVpn *s_vpn = update_into_new_connection(editor, &output);
+    g_assert_false(nm_setting_vpn_get_persistent(s_vpn));
+    g_assert_cmpuint(nm_setting_vpn_get_timeout(s_vpn), ==, 0);
+}
+
+static void
+test_timeout_change_is_saved(void)
+{
+    if (!ensure_gtk())
+        return;
+
+    g_autoptr(GError) error = NULL;
+    g_autoptr(NMVpnEditor) editor = nm_openfortivpn_editor_new(NULL, &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(editor);
+
+    guint changed_count = 0;
+    g_signal_connect(editor, "changed", G_CALLBACK(on_editor_changed), &changed_count);
+
+    GtkWidget *spin = find_widget_of_type(GTK_WIDGET(nm_vpn_editor_get_widget(editor)),
+                                          GTK_TYPE_SPIN_BUTTON);
+    g_assert_nonnull(spin);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin), 300);
+
+    while (g_main_context_iteration(NULL, FALSE)) { }
+    g_assert_cmpuint(changed_count, >, 0);
+
+    g_autoptr(NMConnection) output = NULL;
+    NMSettingVpn *s_vpn = update_into_new_connection(editor, &output);
+    g_assert_cmpuint(nm_setting_vpn_get_timeout(s_vpn), ==, 300);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -255,6 +354,12 @@ main(int argc, char **argv)
                     test_turning_off_save_drops_password);
     g_test_add_func("/openfortivpn/editor/not-saved-password-stays-not-saved",
                     test_not_saved_password_stays_not_saved);
+    g_test_add_func("/openfortivpn/editor/reconnect-settings-are-kept",
+                    test_reconnect_settings_are_kept);
+    g_test_add_func("/openfortivpn/editor/reconnect-settings-default-off",
+                    test_reconnect_settings_default_off);
+    g_test_add_func("/openfortivpn/editor/timeout-change-is-saved",
+                    test_timeout_change_is_saved);
 
     return g_test_run();
 }

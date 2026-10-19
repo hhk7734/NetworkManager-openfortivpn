@@ -138,6 +138,9 @@ right away, make the connection persistent:
 nmcli connection modify <name> vpn.persistent yes
 ```
 
+In the connection's VPN settings (GNOME Settings or nm-connection-editor),
+this is **Reconnect automatically**.
+
 NetworkManager retries once, as a new activation. That needs the password
 again: a password stored with `password-flags=0` works unattended, one kept
 by a secret agent only while you're logged in.
@@ -157,6 +160,8 @@ one, up to 60 s. Attempts stop when:
   ```sh
   nmcli connection modify <name> vpn.timeout 600
   ```
+
+  In the VPN settings this is **Keep trying for (s)**; 0 means the default.
 
 - 10 restarts in a row have failed, about 7 minutes, for a `vpn.timeout`
   longer than that.
