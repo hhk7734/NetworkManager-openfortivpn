@@ -11,6 +11,7 @@
 #                     reject       have the login rejected and exit
 #   FAKE_NETDEV     when 1, create the interface as a dummy link and delete it
 #                   when the tunnel goes down, so NetworkManager can configure it
+#   FAKE_LOGOUT_SEC seconds the logout takes after the tunnel drops (default 0)
 #
 # SIGUSR1 plays the gateway ending the session: the tunnel goes down and the
 # process exits the way openfortivpn does.
@@ -39,7 +40,9 @@ drop() {
   link_down   # pppd exits, taking its interface with it
   echo "INFO:   Terminated pppd."
   echo "INFO:   Closed connection to gateway."
+  sleep "${FAKE_LOGOUT_SEC:-0}"
   echo "INFO:   Logged out."
+  log "exited $(date +%s.%N)"
   exit 1
 }
 

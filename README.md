@@ -129,39 +129,46 @@ nmcli connection up <name>
 ## Reconnecting after the gateway drops the tunnel
 
 If the tunnel goes down on its own once it has been up, for example when the
-gateway ends the session at its time limit, the VPN service restarts
-openfortivpn with the password it was given at connect. It waits 5 s before
-the first attempt and doubles the wait after each one, up to 60 s, until the
-tunnel is back. The wait starts over at 5 s once a tunnel has stayed up for a
-minute.
+gateway ends the session at its time limit, the VPN fails (`connect-failed`
+in the NetworkManager log). NetworkManager takes the VPN down, which brings
+the other network's DNS servers back. To have NetworkManager connect again
+right away, make the connection persistent:
 
-If the gateway's name doesn't resolve during an attempt, the service connects
-to the address it last resolved to and still sends the name as the TLS server
-name (SNI). Expect this whenever the VPN sets DNS servers: they replace the
-other network's, and NetworkManager doesn't switch those back on while the
-VPN is reconnecting. openfortivpn checks the
-gateway's certificate against that address, so this works when `trusted-cert`
-is set (or the certificate lists the address).
+```sh
+nmcli connection modify <name> vpn.persistent yes
+```
 
-While it reconnects, NetworkManager shows the VPN as activating
-(`nmcli connection show --active`), and the old interface's address, routes
-and DNS servers go away with it. Once the tunnel is back, NetworkManager
-configures the new interface and shows the VPN as activated again.
+NetworkManager retries once, as a new activation. That needs the password
+again: a password stored with `password-flags=0` works unattended, one kept
+by a secret agent only while you're logged in.
 
-This only works while that VPN session is still running:
+Until a tunnel is up, the VPN service restarts openfortivpn after an attempt
+that fails, so the retry survives a gateway that is out of reach for a
+while. It waits 5 s before the first restart and doubles the wait after each
+one, up to 60 s. Attempts stop when:
 
-- `nmcli connection down`, or turning the VPN off in the UI, ends the session
-  and stops any further attempts.
-- If the gateway rejects the login on any attempt, the service stops trying
-  and the VPN fails with "Invalid secrets" (`login-failed` in the
-  NetworkManager log).
-- After 10 attempts in a row that don't bring the tunnel back, about 7
-  minutes, the service gives up and the VPN fails (`connect-failed` in the
-  NetworkManager log). NetworkManager then takes the VPN down and switches the
-  other network's DNS servers back on.
-- Once the session has ended, nothing brings it back. That includes the VPN
-  service or NetworkManager exiting or restarting, or the network the VPN runs
-  over going down. Connect again, as you would the first time.
+- `nmcli connection down`, or turning the VPN off in the UI, ends the
+  activation.
+- The gateway rejects the login. The VPN fails with "Invalid secrets"
+  (`login-failed` in the NetworkManager log).
+- NetworkManager's `vpn.timeout` runs out, 60 s by default, about 4 attempts.
+  Raise it to keep trying through longer outages, for example 10 minutes:
+
+  ```sh
+  nmcli connection modify <name> vpn.timeout 600
+  ```
+
+- 10 restarts in a row have failed, about 7 minutes, for a `vpn.timeout`
+  longer than that.
+
+Once attempts have stopped, nothing brings the VPN back; connect again as you
+would the first time. The same goes for a first connect: a mistyped or
+unreachable gateway fails only once attempts stop, not at once.
+
+The service doesn't restart a lost tunnel itself: openfortivpn would bring it
+back on a new interface, and NetworkManager 1.54 keeps the VPN's DNS
+settings under the old one. Once the VPN went down, the other network's DNS
+stayed off until NetworkManager restarted.
 
 ## Uninstall
 
