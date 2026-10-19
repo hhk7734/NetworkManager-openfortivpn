@@ -81,7 +81,7 @@ esac
 
 echo "INFO:   Connected to gateway."
 echo "INFO:   Authenticated."
-echo "INFO:   Got addresses: [10.9.9.2], ns [10.9.9.53]"
+echo "INFO:   Got addresses: [192.0.2.2], ns [192.0.2.53]"
 if [ "${FAKE_NETDEV:-0}" = 1 ]; then
   ip link add "$tundev" type dummy && ip link set "$tundev" up
 fi
