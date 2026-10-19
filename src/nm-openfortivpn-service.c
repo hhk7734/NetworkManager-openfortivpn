@@ -2,10 +2,11 @@
  *
  * nm-openfortivpn-service -- NetworkManager VPN service that drives openfortivpn.
  *
- * Skeleton scope:
+ * What it does:
  *   - subclass NMVpnServicePlugin to claim the D-Bus name
- *   - on Connect, spawn openfortivpn with config built from NMSettingVpn data
- *   - on tunnel-up (parsed from openfortivpn stdout), publish a stub IP4Config
+ *   - on Connect, start openfortivpn with options from the NMSettingVpn data
+ *   - when the tunnel is up (read from openfortivpn's output), send
+ *     NetworkManager a basic IP4Config
  *   - until the tunnel first comes up, restart openfortivpn after a failed
  *     attempt, until RETRY_ATTEMPTS_MAX attempts in a row have failed
  *   - on losing an established tunnel, fail the activation so NetworkManager
@@ -14,8 +15,8 @@
  *     the process stays until openfortivpn has exited, killing it if SIGINT
  *     isn't enough, and after a lost tunnel until it has gone idle
  *
- * The skeleton intentionally does NOT yet ship a pppd plugin; IP4Config push
- * here is best-effort and will need to be replaced for production use.
+ * There is no pppd plugin yet, so the IP4Config is built from openfortivpn's
+ * output and may miss details. A pppd plugin should replace this later.
  */
 
 #include "config.h"
@@ -91,12 +92,12 @@ struct _NMOpenfortivpnPlugin {
     guint         retry_id;         /* pending restart of openfortivpn */
     guint         retry_delay;      /* seconds before the next restart */
     guint         retry_attempts;   /* restarts so far */
-    char         *gateway;          /* configured FQDN, e.g. "vpn.moreh.dev" */
+    char         *gateway;          /* configured FQDN, e.g. "vpn.example.com" */
     char         *tundev;           /* from "Interface pppN is UP", e.g. "ppp1" */
 
     /* Parsed from openfortivpn's "Got addresses: [..], ns [..]" line. Used to
      * build the IP4Config we hand to NetworkManager when the tunnel is up. */
-    char         *local_addr;       /* dotted-quad, e.g. "192.168.60.15" */
+    char         *local_addr;       /* dotted-quad, e.g. "192.0.2.15" */
     char        **dns_list;         /* NULL-terminated dotted-quad strings   */
 };
 
@@ -191,10 +192,10 @@ build_openfortivpn_argv(NMSettingVpn *s_vpn, GError **error)
 }
 
 /* Parse:
- *   "...Got addresses: [192.168.60.15], ns [1.249.213.155, 8.8.8.8]..."
- * The local PPP IP plus DNS list are all we need from openfortivpn's text
- * output; the rest of the route table is installed by openfortivpn itself
- * via /etc/ppp/ip-up.d. A future pppd plugin will replace this scrape. */
+ *   "...Got addresses: [192.0.2.15], ns [192.0.2.53, 192.0.2.54]..."
+ * From openfortivpn's output we only need the local PPP address and the DNS
+ * servers; openfortivpn adds the routes itself through /etc/ppp/ip-up.d.
+ * A future pppd plugin will replace this parsing. */
 static void
 parse_got_addresses(NMOpenfortivpnPlugin *self, const char *line)
 {
@@ -254,7 +255,7 @@ resolve_gateway(NMOpenfortivpnPlugin *self)
 
 /* Build and emit the config NetworkManager expects when the tunnel comes
  * up. All IPv4 addresses must be packed as uint32 in network byte order —
- * passing them as strings (as the earlier skeleton did) made NM silently
+ * passing them as strings (as an early version did) made NM silently
  * drop them and then time out with "no VPN gateway address received".
  * The interface and gateway go in a generic Config ahead of the IP4Config. */
 static void
@@ -383,8 +384,8 @@ on_child_line(GObject *src, GAsyncResult *res, gpointer user_data)
         return;
     }
 
-    /* Echo every child line into the journal so we can see what openfortivpn
-     * is doing during activation. Cheap and high-signal during development. */
+    /* Copy every line from openfortivpn to the journal, so its progress and
+     * errors show up in the NetworkManager log. */
     fprintf(stderr, "openfortivpn: %s\n", line);
     fflush(stderr);
 
@@ -572,9 +573,7 @@ spawn_openfortivpn(NMOpenfortivpnPlugin *self, char **argv, GError **error)
     g_clear_pointer(&self->local_addr, g_free);
     g_clear_pointer(&self->dns_list,   g_strfreev);
 
-    /* Diagnostic: log the exact argv before spawning. fprintf(stderr) instead
-     * of g_message because we're trying to determine whether glib's structured
-     * logger is reaching journald at all. */
+    /* Log the full command line (the password goes over stdin, not here). */
     fprintf(stderr, "nm-openfortivpn-service: spawning:");
     for (int i = 0; argv[i]; i++) fprintf(stderr, " %s", argv[i]);
     fputc('\n', stderr);
@@ -718,7 +717,7 @@ nm_openfortivpn_plugin_dispose(GObject *obj)
     if (self->cancellable)
         g_cancellable_cancel(self->cancellable);
 
-    /* Last resort: main() waits for the child, so it should be gone here. */
+    /* Only as a fallback: main() waits for the child, so it should be gone. */
     if (self->child)
         g_subprocess_force_exit(self->child);
 
@@ -855,7 +854,7 @@ on_child_exited_quit(G_GNUC_UNUSED NMOpenfortivpnPlugin *plugin, gpointer user_d
 int
 main(int argc, char *argv[])
 {
-    /* Startup marker — verifies our stderr is captured by whoever spawned us. */
+    /* Mark the start in the log. */
     fprintf(stderr, "nm-openfortivpn-service: started, pid=%d\n", getpid());
     fflush(stderr);
 
