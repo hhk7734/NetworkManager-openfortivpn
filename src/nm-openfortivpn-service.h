@@ -13,6 +13,7 @@ G_DECLARE_FINAL_TYPE(NMOpenfortivpnPlugin, nm_openfortivpn_plugin,
 
 NMOpenfortivpnPlugin *nm_openfortivpn_plugin_new(const char *bus_name, GError **error);
 gboolean nm_openfortivpn_plugin_has_child(NMOpenfortivpnPlugin *self);
+gboolean nm_openfortivpn_plugin_awaits_retry(NMOpenfortivpnPlugin *self);
 
 G_END_DECLS
 

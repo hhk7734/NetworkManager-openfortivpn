@@ -43,6 +43,7 @@ events() {
 }
 states() { events | grep '^StateChanged' | cut -d' ' -f2 | paste -sd' '; }
 last_failure() { events | grep '^Failure' | tail -n1; }
+reported_stopped() { events | grep -q '^StateChanged 6$'; }
 
 # start_gaps -- seconds between consecutive openfortivpn starts
 start_gaps() {
@@ -86,6 +87,13 @@ plugin_call() {
     --method "org.freedesktop.NetworkManager.VPN.Plugin.$1" "${@:2}" >/dev/null
 }
 
+connect() {
+  plugin_call Connect "{'connection': {'id': <'test'>, 'uuid': <'00000000-0000-0000-0000-000000000001'>, 'type': <'vpn'>},
+    'vpn': {'service-type': <'org.freedesktop.NetworkManager.openfortivpn'>,
+            'data': <{'gateway': '${gateway:-192.0.2.1}', 'user': 'test'}>,
+            'secrets': <{'password': 'secret'}>}}"
+}
+
 # start_connected [ENV=VALUE...] -- start the service and connect it, to
 # $gateway (default 192.0.2.1). With $hosts set, the service sees that file
 # as /etc/hosts.
@@ -110,10 +118,7 @@ start_connected() {
       --object-path /org/freedesktop/NetworkManager/VPN/Plugin >/dev/null 2>&1 && break
     sleep 0.1
   done
-  plugin_call Connect "{'connection': {'id': <'test'>, 'uuid': <'00000000-0000-0000-0000-000000000001'>, 'type': <'vpn'>},
-    'vpn': {'service-type': <'org.freedesktop.NetworkManager.openfortivpn'>,
-            'data': <{'gateway': '${gateway:-192.0.2.1}', 'user': 'test'}>,
-            'secrets': <{'password': 'secret'}>}}"
+  connect
   for _ in $(seq 50); do
     grep -q 'Tunnel is up\|rejected the login' "$tmpdir/service.log" && break
     sleep 0.1
@@ -167,52 +172,53 @@ wait_gone 3 "$fake" && pass "SIGTERM stops openfortivpn" \
 wait_gone 3 "$svc_pid" && pass "service exits after SIGTERM" \
                        || fail "service hung after SIGTERM"
 
-# 5. The gateway ends the session: the service reports reconnecting, starts
-#    openfortivpn again with the same password and publishes the new tunnel.
-start_connected FAKE_TUNDEV=ppp7
+# 5. The gateway ends the session: the service fails the activation instead
+#    of restarting openfortivpn, so NetworkManager takes the VPN down. Under
+#    a bus name per activation, as NetworkManager 1.54 passes, NetworkManager
+#    retries (with vpn.persistent) through a new service, so this one exits.
+start_connected FAKE_LOGOUT_SEC=1
 drop_tunnel
-if wait_until 10 tunnels_reach 2; then
-  pass "lost tunnel is restored"
+if wait_gone 5 "$svc_pid"; then
+  pass "lost tunnel ends a per-activation service"
 else
-  fail "lost tunnel not restored; openfortivpn started $(starts) times"
+  fail "per-activation service still running after the tunnel was lost"
 fi
-sleep 0.3
-# libnm reports started as soon as the second Config is out, before its
-# Ip4Config; NetworkManager waits for both anyway.
-reconnect=$(events | awk 'seen; $0 == "StateChanged 3" && ++n == 2 { seen = 1 }' | sort | paste -sd,)
-if [ "$(states)" = "3 4 3 4" ] && [ "$reconnect" = "Config,Ip4Config,StateChanged 4" ]; then
-  pass "service reports starting while reconnecting, then the new config"
-else
-  fail "unexpected signals: $(events | paste -sd,)"
-fi
-if [ "$(sed -n 's/^password //p' "$tmpdir/fake.log" | sort -u)" = secret ] &&
-   [ "$(grep -c '^password ' "$tmpdir/fake.log")" = 2 ]; then
-  pass "reconnect reuses the session password"
-else
-  fail "reconnect passwords: $(sed -n 's/^password //p' "$tmpdir/fake.log" | tr '\n' ' ')"
-fi
-alive "$svc_pid" && pass "service keeps running through the reconnect" \
-                 || fail "service exited on tunnel loss"
+stop_monitor
 
-# A tunnel that drops again right after coming back waits longer (2 s, not 1).
+# 5b. Under the default bus name the retry comes to the same service, at
+#     once, while openfortivpn may still be logging out: it stays for it.
+start_connected NM_OPENFORTIVPN_TEST_SHARED_NAME=1 FAKE_TUNDEV=ppp7 FAKE_LOGOUT_SEC=1
 drop_tunnel
-if wait_until 10 tunnels_reach 3; then
-  wait=$(awk '$1 == "dropped" { d = $2 } $1 == "time" && d { w = $3 - d } END { printf "%.1f", w }' "$tmpdir/fake.log")
-  awk -v w="$wait" 'BEGIN { exit !(w >= 1.9) }' \
-    && pass "tunnel dropping right after a reconnect backs off (${wait} s)" \
-    || fail "tunnel dropping right after a reconnect retried after ${wait} s"
+wait_until 3 reported_stopped
+[ "$(last_failure)" = "Failure 1" ] && pass "lost tunnel is reported as connect failed" \
+                                    || fail "lost tunnel reported as $(last_failure)"
+[ "$(events | tail -n1)" = "StateChanged 6" ] && pass "lost tunnel stops the service" \
+                                              || fail "last signal is $(events | tail -n1), not stopped"
+[ "$(starts)" = 1 ] && pass "lost tunnel isn't restarted by the service" \
+                    || fail "openfortivpn started $(starts) times after the tunnel was lost"
+connect
+if wait_until 10 tunnels_reach 2; then
+  pass "retry through the same service brings the tunnel up"
 else
-  fail "tunnel not restored after dropping again"
+  fail "retry didn't bring the tunnel up; openfortivpn started $(starts) times"
 fi
+started=$(awk '$1 == "time" { t = $3 } END { print t }' "$tmpdir/fake.log")
+exited=$(sed -n 's/^exited //p' "$tmpdir/fake.log" | head -n1)
+awk -v s="$started" -v e="$exited" 'BEGIN { exit !(s >= e) }' \
+  && pass "retry waits for the last openfortivpn to exit" \
+  || fail "retry started openfortivpn at $started, before the last one exited at $exited"
+sleep 0.3
+[ "$(states | sed 's/.* 6 //')" = "3 4" ] && pass "retry reports starting, then started" \
+                                          || fail "states went $(states)"
 plugin_call Disconnect
-wait_gone 3 "$svc_pid" || fail "service still running after disconnect"
+wait_gone 3 "$svc_pid" && pass "service exits after disconnecting the retry" \
+                       || fail "service still running after disconnecting the retry"
 stop_monitor
 
 # 6. Attempts that can't reach the gateway are retried, further apart each
-#    time (1, 2, 4 s in the test build).
-start_connected
-set_mode unreachable
-drop_tunnel
+#    time (1, 2, 4 s in the test build), with the same password, until the
+#    tunnel comes up.
+initial_mode=unreachable start_connected
 if wait_until 12 starts_reach 4; then
   gaps=$(start_gaps | tail -n2 | paste -sd' ')
   if awk -v g="$gaps" 'BEGIN { split(g, a, " "); exit !(a[1] >= 1 && a[2] >= 2 * a[1] - 0.5) }'; then
@@ -224,43 +230,50 @@ else
   fail "failed attempts not retried; openfortivpn started $(starts) times"
 fi
 set_mode up
-if wait_until 15 tunnels_reach 2; then
+if wait_until 15 tunnels_reach 1; then
   sleep 0.3
-  [ "$(states)" = "3 4 3 4" ] \
-    && pass "tunnel restored once the gateway is reachable" \
-    || fail "tunnel up again but states went $(states)"
+  [ "$(states)" = "3 4" ] \
+    && pass "tunnel comes up once the gateway is reachable" \
+    || fail "tunnel up but states went $(states)"
 else
-  fail "tunnel not restored after the gateway came back"
+  fail "tunnel not up after the gateway came back"
+fi
+if [ "$(sed -n 's/^password //p' "$tmpdir/fake.log" | sort -u)" = secret ]; then
+  pass "retries reuse the password"
+else
+  fail "retry passwords: $(sed -n 's/^password //p' "$tmpdir/fake.log" | tr '\n' ' ')"
 fi
 plugin_call Disconnect
 wait_gone 3 "$svc_pid" || fail "service still running after disconnect"
 stop_monitor
 
-# 7. Disconnecting while waiting to reconnect ends the session for good.
-start_connected
-set_mode unreachable
-drop_tunnel
+# 7. Disconnecting while waiting to retry ends the session for good.
+initial_mode=unreachable start_connected
 wait_until 5 starts_reach 2
 plugin_call Disconnect
-wait_gone 3 "$svc_pid" && pass "disconnect while reconnecting stops the service" \
-                       || fail "service still running after disconnect while reconnecting"
+wait_gone 3 "$svc_pid" && pass "disconnect while retrying stops the service" \
+                       || fail "service still running after disconnect while retrying"
 n=$(starts)
 sleep 3
 [ "$(starts)" = "$n" ] && pass "no attempts after disconnect" \
                        || fail "openfortivpn started after disconnect"
 stop_monitor
 
-# 8. A rejected login while reconnecting stops retrying and reports why.
-start_connected
+# 8. A rejected login on a retry stops retrying and reports why.
+initial_mode=unreachable start_connected
 set_mode reject
-drop_tunnel
 if wait_gone 5 "$svc_pid"; then
-  pass "rejected login while reconnecting stops the service"
+  pass "rejected login while retrying stops the service"
 else
   fail "service still running after a rejected login"
 fi
-[ "$(starts)" = 2 ] && pass "no retries after a rejected login" \
-                    || fail "openfortivpn started $(starts) times after a rejected login"
+n=$(starts)
+sleep 2
+if [ "$(starts)" = "$n" ] && [ "$(sed -n 's/^mode //p' "$tmpdir/fake.log" | tail -n1)" = reject ]; then
+  pass "no retries after a rejected login"
+else
+  fail "openfortivpn started again after a rejected login"
+fi
 stop_monitor
 [ "$(last_failure)" = "Failure 0" ] && pass "rejected login is reported as login failed" \
                                     || fail "rejected login reported as $(last_failure)"
@@ -275,55 +288,32 @@ stop_monitor
 [ "$(last_failure)" = "Failure 0" ] && pass "rejected first login is reported as login failed" \
                                     || fail "rejected first login reported as $(last_failure)"
 
-# 10. While the gateway's name doesn't resolve, which NetworkManager causes
-#     by keeping DNS off until the VPN is back, reconnect to the address it
-#     last resolved to and name the gateway in the TLS handshake.
+# 10. The published config carries the address the gateway's name resolves
+#     to, which NetworkManager routes over the network the VPN runs on.
 name=vpn.nm-openfortivpn.test
 echo "192.0.2.1 $name" > "$tmpdir/hosts"
 hosts=$tmpdir/hosts gateway=$name start_connected
-: > "$tmpdir/hosts"
-drop_tunnel
-if wait_until 10 tunnels_reach 2; then
-  pass "tunnel restored while the gateway's name doesn't resolve"
-else
-  fail "tunnel not restored without DNS; openfortivpn started $(starts) times"
-fi
-args=$(sed -n 's/^args //p' "$tmpdir/fake.log")
-first=$(head -n1 <<< "$args" | cut -d' ' -f1)
-retry=$(tail -n1 <<< "$args")
-[ "$first" = "$name" ] && pass "first connect uses the gateway's name" \
-                       || fail "first connect went to $first"
-if [ "${retry%% *}" = 192.0.2.1 ] && [[ " $retry " = *" --sni=$name "* ]]; then
-  pass "reconnect uses the last address with the name as SNI"
-else
-  fail "reconnect args: $retry"
-fi
 sleep 0.3
 stop_monitor
-# Both Configs carry 192.0.2.1, as a uint32 in network byte order read on a
-# little-endian host. libnm copies it into the Ip4Configs too, so skip those.
-configs=$(grep 'VPN\.Plugin\.Config ' "$tmpdir/monitor.log")
-if [ "$(grep -c . <<< "$configs")" = 2 ] &&
-   [ "$(grep -c "'gateway': <uint32 16908480>" <<< "$configs")" = 2 ]; then
-  pass "reconnected config keeps the gateway address"
+# 192.0.2.1 as a uint32 in network byte order, read on a little-endian host.
+if grep 'VPN\.Plugin\.Config ' "$tmpdir/monitor.log" | grep -q "'gateway': <uint32 16908480>"; then
+  pass "config carries the gateway's address"
 else
-  fail "gateway address in configs: $(grep -o "'gateway': <[^>]*>" <<< "$configs" | paste -sd' ')"
+  fail "gateway address in config: $(grep -o "'gateway': <[^>]*>" "$tmpdir/monitor.log" | paste -sd' ')"
 fi
 plugin_call Disconnect
 wait_gone 3 "$svc_pid" || fail "service still running after disconnect"
+hosts=
 
 # 11. A gateway that stays out of reach is given up on after
-#     RECONNECT_ATTEMPTS_MAX (5 in the test build) attempts, so NetworkManager
-#     takes the VPN down and switches the other network's DNS back on.
-start_connected
-set_mode unreachable
-drop_tunnel
+#     RETRY_ATTEMPTS_MAX (5 in the test build) retries.
+initial_mode=unreachable start_connected
 if wait_gone 45 "$svc_pid"; then
   pass "service gives up on a gateway that stays out of reach"
 else
-  fail "service still reconnecting; openfortivpn started $(starts) times"
+  fail "service still retrying; openfortivpn started $(starts) times"
 fi
-[ "$(starts)" = 6 ] && pass "gave up after 5 attempts" \
+[ "$(starts)" = 6 ] && pass "gave up after 5 retries" \
                     || fail "openfortivpn started $(starts) times, not 6"
 stop_monitor
 [ "$(last_failure)" = "Failure 1" ] && pass "giving up is reported as connect failed" \
