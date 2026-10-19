@@ -111,6 +111,47 @@
           </object>
         </child>
 
+        <child>
+          <object class="GtkLabel">
+            <property name="label" translatable="yes">Reconnect automatically</property>
+            <property name="xalign">1</property>
+            <layout><property name="column">0</property><property name="row">6</property></layout>
+          </object>
+        </child>
+        <child>
+          <object class="GtkSwitch" id="reconnect-switch">
+            <property name="halign">start</property>
+            <property name="tooltip-text" translatable="yes">When the tunnel drops, connect again right away. Needs a saved password.</property>
+            <layout><property name="column">1</property><property name="row">6</property></layout>
+          </object>
+        </child>
+
+        <child>
+          <object class="GtkLabel">
+            <property name="label" translatable="yes">_Keep trying for (s)</property>
+            <property name="use-underline">true</property>
+            <property name="xalign">1</property>
+            <property name="mnemonic-widget">timeout-spin</property>
+            <layout><property name="column">0</property><property name="row">7</property></layout>
+          </object>
+        </child>
+        <child>
+          <object class="GtkSpinButton" id="timeout-spin">
+            <property name="halign">start</property>
+            <property name="numeric">true</property>
+            <property name="tooltip-text" translatable="yes">How long a connect keeps retrying a gateway that doesn't answer. 0 uses the default, 60 seconds.</property>
+            <property name="adjustment">
+              <object class="GtkAdjustment">
+                <property name="lower">0</property>
+                <property name="upper">86400</property>
+                <property name="step-increment">10</property>
+                <property name="page-increment">60</property>
+              </object>
+            </property>
+            <layout><property name="column">1</property><property name="row">7</property></layout>
+          </object>
+        </child>
+
       </object>
     </child>
   </object>
